@@ -1,9 +1,8 @@
-"""AI Room — a classroom where a local LLM learns without gradient training.
+"""AI Room — a classroom where a language model (at most 27B parameters) learns without training.
 
-The student model's weights never change. Instead it "learns" the way a human
-student does: it listens to lessons, writes notes into a persistent notebook,
-asks questions, reflects on its mistakes, and re-reads the relevant notes
-before every exam question (retrieval-augmented, in-context learning).
+The student is the only AI. It never has its weights changed: it learns by taking
+notes, asking questions and re-reading its notebook. The teacher is not a model —
+it is made of exact problem generators, a textbook library and question banks.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

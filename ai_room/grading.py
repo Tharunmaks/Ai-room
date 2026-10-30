@@ -3,11 +3,13 @@ multiple-choice comparison, and sandboxed execution of code answers."""
 
 from __future__ import annotations
 
+import difflib
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from fractions import Fraction
 
 _FINAL = re.compile(r"final\s*answer\s*[:=\-]\s*(.+)", re.IGNORECASE)
@@ -46,16 +48,75 @@ def parse_number(text: str) -> float | None:
     return val / 100 if pct else val
 
 
-def numeric_match(given: str, expected: str, rel_tol: float = 0.01) -> bool:
+def numeric_match(given: str, expected: str, rel_tol: float = 0.01, exact: bool | None = None) -> bool:
+    """Compare numbers. Integer answer keys must match exactly and others within rel_tol,
+    unless `exact` says otherwise (rounded keys such as '3 significant figures' pass exact=False)."""
     g, e = parse_number(given), parse_number(expected)
     if g is None or e is None:
         return False
+    if exact is None:
+        exact = re.fullmatch(r"[-+]?\d+", str(expected).strip().replace(",", "")) is not None
+    tol = 1e-9 if exact else rel_tol
     if e == 0:
         return abs(g) < 1e-6
-    if abs(g - e) <= rel_tol * abs(e):
+    if abs(g - e) <= tol * abs(e):
         return True
     # Accept percentages written as either 25% or 25 when the key says 0.25 (and vice versa).
-    return abs(g / 100 - e) <= rel_tol * abs(e) or abs(g * 100 - e) <= rel_tol * abs(e)
+    return abs(g / 100 - e) <= tol * abs(e) or abs(g * 100 - e) <= tol * abs(e)
+
+
+_ARTICLES = {"the", "a", "an"}
+
+
+_FOLD = {"ß": "ss", "œ": "oe", "æ": "ae", "ø": "o", "đ": "d", "ł": "l", "ı": "i"}
+
+
+def _fold(text: str) -> str:
+    """Lower-case, drop accents on Latin letters, keep other scripts (Chinese, Devanagari, …) intact."""
+    out = []
+    for ch in (text or "").lower():
+        if ord(ch) < 0x250:  # Latin: strip combining accents
+            decomposed = unicodedata.normalize("NFKD", _FOLD.get(ch, ch))
+            out.append("".join(c for c in decomposed if not unicodedata.combining(c)))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _norm_term(text: str) -> list[str]:
+    s = _fold(text).replace("-", " ")
+    s = "".join(c if (c.isalnum() or c.isspace() or unicodedata.category(c) in ("Mn", "Mc")) else " " for c in s)
+    words = [w for w in s.split() if w]
+    while words and words[0] in _ARTICLES:
+        words.pop(0)
+    return [_stem(w) for w in words]
+
+
+def _stem(w: str) -> str:
+    if len(w) > 4 and w.endswith("ies"):
+        return w[:-3] + "y"
+    if len(w) > 4 and w.endswith(("ses", "xes", "ches", "shes")):
+        return w[:-2]
+    if len(w) > 3 and w.endswith("s") and not w.endswith("ss"):
+        return w[:-1]
+    return w
+
+
+def cloze_match(given: str, expected: str) -> bool:
+    """Fill-in-the-blank matching: case, articles, punctuation and plurals are ignored."""
+    g, e = _norm_term(given), _norm_term(expected)
+    if not g or not e:
+        return False
+    if g == e:
+        return True
+    gs, es = " ".join(g), " ".join(e)
+    return len(es) >= 7 and difflib.SequenceMatcher(None, gs, es).ratio() >= 0.92
+
+
+def exact_match(given: str, expected: str) -> bool:
+    """Whitespace- and case-insensitive equality; punctuation and symbols still count."""
+    f = lambda x: " ".join((x or "").strip().strip("`*").split()).lower()  # noqa: E731
+    return f(given) == f(expected)
 
 
 def mcq_match(given: str, expected: str) -> bool:

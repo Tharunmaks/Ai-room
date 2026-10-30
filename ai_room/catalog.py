@@ -8,9 +8,9 @@ what came before (see `expand_syllabus`).
 
 from __future__ import annotations
 
-Q = "numeric,mcq,short"   # quantitative subjects
-C = "code,mcq,short"      # programming subjects
-T = "mcq,short"           # conceptual / written subjects
+Q = "numeric,mcq,cloze"   # quantitative subjects
+C = "code,mcq,cloze"      # programming subjects
+T = "mcq,cloze"           # conceptual / written subjects
 
 CATALOG = f"""
 # Mathematics & Statistics
@@ -150,3 +150,27 @@ def expand_syllabus(milestones: list[str]) -> tuple[str, ...]:
     grades[-1] = (f"{milestones[-1]}: expert-level problems, integrating everything from "
                   f"{milestones[0]} to {milestones[-2]}")
     return tuple(grades)
+
+
+ICONS = {
+    "statistics": "📊", "probability": "🎲", "geometry": "📐", "linear_algebra": "🧮", "calculus": "∫",
+    "number_theory": "🔢", "discrete_math": "🕸️", "optimization": "🎯", "numerical_methods": "🧰",
+    "astronomy": "🔭", "astrophysics": "🌌", "earth_science": "🌋", "meteorology": "⛈️", "oceanography": "🌊",
+    "materials_science": "🧱", "electronics": "🔌", "quantum_computing": "⚛️", "organic_chemistry": "⚗️",
+    "biochemistry": "🧫", "genetics": "🧬", "ecology": "🌿", "neuroscience": "🧠", "microbiology": "🦠",
+    "botany": "🌱", "zoology": "🦁", "anatomy": "🦴", "medicine": "🩺", "nutrition": "🥗", "psychology": "🪞",
+    "public_health": "🏥", "pharmacology": "💊", "mechanical_eng": "⚙️", "electrical_eng": "⚡",
+    "civil_eng": "🌉", "chemical_eng": "🏭", "aerospace_eng": "🚀", "robotics": "🤖", "control_systems": "🎛️",
+    "signal_processing": "📡", "environmental_eng": "♻️", "biomedical_eng": "🫀", "data_structures": "🌳",
+    "algorithms": "🧭", "machine_learning": "📈", "deep_learning": "🕸", "nlp": "💬", "computer_vision": "👁️",
+    "databases": "🗄️", "operating_systems": "🧠", "networking": "🌐", "cybersecurity": "🛡️", "web_dev": "🕸️",
+    "software_engineering": "🏗️", "distributed_systems": "☁️", "compilers": "🔧", "data_science": "🧪",
+    "cloud_computing": "⛅", "reinforcement_learning": "🕹️", "ai_safety": "🧯", "economics": "💹",
+    "microeconomics": "🛒", "macroeconomics": "🏦", "finance": "💰", "accounting": "🧾", "sociology": "👥",
+    "political_science": "🗳️", "law": "⚖️", "international_relations": "🌍", "anthropology": "🏺",
+    "geography": "🗺️", "linguistics": "🔤", "education": "🎓", "business": "💼", "marketing": "📣",
+    "entrepreneurship": "💡", "philosophy": "🤔", "ethics": "🕊️", "world_literature": "📖",
+    "creative_writing": "🖋️", "art_history": "🎨", "music_theory": "🎼", "film_studies": "🎬",
+    "religious_studies": "🕯️", "classics": "🏛️", "archaeology": "⛏️", "spanish": "🇪🇸", "french": "🇫🇷",
+    "german": "🇩🇪", "mandarin": "🇨🇳", "hindi": "🇮🇳",
+}

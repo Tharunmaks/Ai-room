@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .catalog import expand_syllabus, parse_catalog
+from .catalog import ICONS, expand_syllabus, parse_catalog
 
 NUM_GRADES = 12
 PASS_MARK = 0.90
@@ -26,10 +26,11 @@ class Subject:
     question_types: tuple[str, ...]  # allowed exam question types
     grades: tuple[str, ...]          # 12 topic lists, one per grade
     category: str = "Core"
+    icon: str = "📘"
 
 
 SUBJECTS: dict[str, Subject] = {s.key: s for s in [
-    Subject("math", "Mathematics", ("numeric", "mcq", "short"), (
+    Subject("math", "Mathematics", ("numeric", "mcq", "cloze"), (
         "counting, place value, addition and subtraction of whole numbers",
         "multiplication, division, remainders, order of operations",
         "fractions, decimals, percentages, ratios",
@@ -43,7 +44,7 @@ SUBJECTS: dict[str, Subject] = {s.key: s for s in [
         "real analysis (epsilon-delta), abstract algebra (groups, rings), proof techniques",
         "complex analysis, topology basics, measure-theoretic probability, olympiad-style problem solving",
     )),
-    Subject("physics", "Physics", ("numeric", "mcq", "short"), (
+    Subject("physics", "Physics", ("numeric", "mcq", "cloze"), (
         "units, measurement, what force, motion and energy are",
         "speed, distance, time; mass vs weight; simple machines",
         "Newton's three laws, friction, density and pressure",
@@ -57,7 +58,7 @@ SUBJECTS: dict[str, Subject] = {s.key: s for s in [
         "quantum mechanics (Schrodinger equation, operators, hydrogen atom), statistical mechanics",
         "general relativity basics, quantum field theory concepts, condensed matter and particle physics",
     )),
-    Subject("logic", "Logical Thinking", ("mcq", "short", "numeric"), (
+    Subject("logic", "Logical Thinking", ("mcq", "cloze", "numeric"), (
         "patterns and sequences, sorting and classifying, same/different",
         "if-then reasoning, simple puzzles, true/false statements",
         "logical connectives (and, or, not), truth tables",
@@ -71,7 +72,7 @@ SUBJECTS: dict[str, Subject] = {s.key: s for s in [
         "modal logic, paradoxes, computability and decidability basics",
         "Gödel's incompleteness ideas, formal systems, hard multi-step reasoning challenges",
     )),
-    Subject("code", "Coding", ("code", "mcq", "short"), (
+    Subject("code", "Coding", ("code", "mcq", "cloze"), (
         "what a program is, variables, printing, basic arithmetic in Python",
         "conditionals, loops, simple string handling",
         "functions, lists, dictionaries, basic debugging",
@@ -85,7 +86,7 @@ SUBJECTS: dict[str, Subject] = {s.key: s for s in [
         "advanced algorithms (segment trees, network flow, string matching), complexity classes",
         "compilers/interpreters, distributed systems, performance engineering, competitive programming",
     )),
-    Subject("research", "Research Skills", ("short", "mcq"), (
+    Subject("research", "Research Skills", ("cloze", "mcq"), (
         "asking good questions, observation vs opinion",
         "finding information, distinguishing facts from claims",
         "summarising a text, identifying the main idea and supporting evidence",
@@ -99,7 +100,7 @@ SUBJECTS: dict[str, Subject] = {s.key: s for s in [
         "writing a research proposal, choosing methods, identifying open problems",
         "producing original research ideas, critiquing state-of-the-art work, meta-analysis",
     )),
-    Subject("chemistry", "Chemistry", ("numeric", "mcq", "short"), (
+    Subject("chemistry", "Chemistry", ("numeric", "mcq", "cloze"), (
         "states of matter, mixtures vs pure substances",
         "atoms, elements, the periodic table layout",
         "atomic structure, electrons, ions, isotopes",
@@ -113,7 +114,7 @@ SUBJECTS: dict[str, Subject] = {s.key: s for s in [
         "quantum chemistry, spectroscopy, thermodynamics (Gibbs energy, entropy)",
         "advanced synthesis, catalysis, computational chemistry concepts",
     )),
-    Subject("biology", "Biology", ("mcq", "short"), (
+    Subject("biology", "Biology", ("mcq", "cloze"), (
         "living vs non-living, basic needs of organisms",
         "plants and animals, habitats, life cycles",
         "cells, organs and organ systems",
@@ -127,7 +128,7 @@ SUBJECTS: dict[str, Subject] = {s.key: s for s in [
         "genomics, bioinformatics concepts, systems biology",
         "frontier topics: CRISPR, synthetic biology, neuroscience, experimental design critique",
     )),
-    Subject("language", "Language & Writing", ("short", "mcq"), (
+    Subject("language", "Language & Writing", ("cloze", "mcq"), (
         "letters, words, simple sentences",
         "nouns, verbs, adjectives, punctuation",
         "paragraphs, topic sentences, reading comprehension",
@@ -141,7 +142,7 @@ SUBJECTS: dict[str, Subject] = {s.key: s for s in [
         "stylistics, discourse analysis, translation challenges",
         "publication-quality writing, critique and revision of expert texts",
     )),
-    Subject("history", "History & Society", ("mcq", "short"), (
+    Subject("history", "History & Society", ("mcq", "cloze"), (
         "past vs present, family and community history",
         "early humans, ancient civilisations (Mesopotamia, Egypt, Indus, China)",
         "classical Greece, Rome, Maurya and Han empires",
@@ -155,7 +156,7 @@ SUBJECTS: dict[str, Subject] = {s.key: s for s in [
         "comparative history, causes of long-run development",
         "original historical argument, evaluating competing interpretations",
     )),
-    Subject("cs", "Computer Science Theory", ("mcq", "short", "numeric"), (
+    Subject("cs", "Computer Science Theory", ("mcq", "cloze", "numeric"), (
         "what a computer is, input/output, binary on/off",
         "binary numbers, bits and bytes, simple algorithms as recipes",
         "boolean logic gates, flowcharts",
@@ -174,9 +175,14 @@ SUBJECTS: dict[str, Subject] = {s.key: s for s in [
 for _key, _name, _category, _types, _milestones in parse_catalog():
     if _key in SUBJECTS:
         raise ValueError(f"duplicate subject key {_key}")
-    SUBJECTS[_key] = Subject(_key, _name, _types, expand_syllabus(_milestones), _category)
+    SUBJECTS[_key] = Subject(_key, _name, _types, expand_syllabus(_milestones), _category, ICONS.get(_key, "📘"))
 
 CATEGORIES: list[str] = list(dict.fromkeys(s.category for s in SUBJECTS.values()))
+
+_CORE_ICONS = {"math": "🧮", "physics": "⚛️", "logic": "🧩", "code": "💻", "research": "🔎", "chemistry": "🧪",
+               "biology": "🧬", "language": "✍️", "history": "🏺", "cs": "🖥️"}
+for _k, _i in _CORE_ICONS.items():
+    SUBJECTS[_k] = Subject(**{**SUBJECTS[_k].__dict__, "icon": _i})
 
 DEFAULT_SUBJECTS = ("math", "physics", "logic", "code", "research")
 
@@ -188,3 +194,45 @@ def topics_for(subject: str, grade: int) -> str:
 
 def difficulty(grade: int) -> str:
     return DIFFICULTY[grade - 1]
+
+
+def split_topics(text: str) -> list[str]:
+    """Split a syllabus line into topic phrases (commas/semicolons outside brackets)."""
+    parts, depth, cur = [], 0, ""
+    for ch in text:
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth = max(0, depth - 1)
+        if ch in ",;" and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    parts.append(cur)
+    out = []
+    for p in parts:
+        p = p.strip().rstrip(".")
+        for lead in ("and ", "or "):
+            if p.lower().startswith(lead):
+                p = p[len(lead):]
+        if p:
+            out.append(p)
+    return out
+
+
+def topic_phrases(subject: str, grade: int) -> list[str]:
+    """The topic phrases a class covers (catalogue subjects use the milestone before the colon)."""
+    text = SUBJECTS[subject].grades[grade - 1]
+    if SUBJECTS[subject].category != "Core":
+        return [text.split(":")[0].strip()]
+    return split_topics(text)
+
+
+def topic_queries(subject: str) -> list[tuple[str, int]]:
+    """Distinct (phrase, first class that uses it) pairs for fetching textbooks."""
+    seen: dict[str, int] = {}
+    for g in range(1, NUM_GRADES + 1):
+        for ph in topic_phrases(subject, g):
+            seen.setdefault(ph, g)
+    return list(seen.items())
