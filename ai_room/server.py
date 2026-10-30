@@ -100,7 +100,7 @@ def _safe_public_url(url: str) -> str:
     return url
 
 
-def create_app(db_path: str | None = None, library_path: str | None = None, llm_factory=None, fetcher=None) -> FastAPI:
+def create_app(db_path: str | None = None, library_path: str | None = None, llm_factory=None, fetcher=None, workspace: str | None = None, workshop_llm_factory=None) -> FastAPI:
     """`llm_factory(cfg) -> student_llm` and `fetcher` let tests inject a model and a fake Wikimedia."""
     db = db_path or os.environ.get("AI_ROOM_DB", "data/ai_room.db")
     lib_path = library_path or os.environ.get("AI_ROOM_LIBRARY") or (":memory:" if db == ":memory:" else os.path.join(os.path.dirname(db) or ".", "library.db"))
@@ -436,6 +436,9 @@ def create_app(db_path: str | None = None, library_path: str | None = None, llm_
         if not added:
             raise HTTPException(400, "No usable questions found. Check the format in the README (question, answer, type, options…).")
         return {"added": added, "subjects": {s: len(q) for s, q in by_subject.items()}}
+
+    from .workshop_api import mount as mount_workshop
+    mount_workshop(app, None if db == ":memory:" else (os.path.dirname(db) or "."), workspace, workshop_llm_factory)
 
     app.mount("/static", StaticFiles(directory=WEB), name="static")
     return app

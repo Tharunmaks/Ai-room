@@ -25,12 +25,12 @@ from ..memory import tokenize
 # What a tool may touch. The user decides which levels are allowed.
 RISKS = {
     "safe": "pure computation — no files, no network",
-    "files": "reads and writes files inside the workspace folder",
+    "files": "reads and writes files inside the workspace folder (including fixed programs like ffmpeg)",
     "network": "reads public web pages and APIs",
-    "exec": "runs programs on this computer (Python, ffmpeg, Blender…)",
+    "exec": "runs code or commands chosen by the student on this computer (Python, shell, Blender scripts, downloaders)",
     "post": "publishes or changes something on an outside account (YouTube, Instagram, GitHub…)",
 }
-DEFAULT_ALLOWED = ("safe", "files", "network", "exec")  # posting is always opt-in
+DEFAULT_ALLOWED = ("safe", "files", "network")  # running code ("exec") and posting online ("post") are opt-in
 
 
 class ToolError(Exception):
@@ -88,8 +88,10 @@ class Context:
         root = self.workspace.resolve()
         if p != root and root not in p.parents:
             raise ToolError(f"'{rel}' is outside the workspace; use a relative path like 'work/{Path(rel).name}'")
-        if must_exist and not p.exists():
-            raise ToolError(f"file not found in the workspace: {rel}")
+        if must_exist:
+            if not p.exists():
+                raise ToolError(f"file not found in the workspace: {rel}")
+            return p
         p.parent.mkdir(parents=True, exist_ok=True)
         return p
 
