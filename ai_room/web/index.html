@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Room</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">🏫 <b>AI Room</b> <span class="muted">— learning without training</span></div>
+  <select id="roomSelect" aria-label="Classroom"></select>
+  <button id="newRoomBtn" class="ghost">+ New classroom</button>
+</header>
+
+<main id="empty" class="empty">
+  <h2>No classroom yet</h2>
+  <p>Create a classroom, pick a student model (≤ <span class="maxb">27</span>B parameters), a teacher style and the subjects.</p>
+  <button id="emptyNew">Create a classroom</button>
+</main>
+
+<main id="room" class="layout" hidden>
+  <section class="center">
+    <div class="ladder" id="ladder"></div>
+    <div class="controls">
+      <button data-run="class" title="Lessons, then exams; retakes until pass or attempts run out">▶ Run class</button>
+      <button data-run="all" title="Keep going class after class until graduation or stuck">⏩ Run all 12 classes</button>
+      <button data-run="lessons" class="ghost">Lessons only</button>
+      <button data-run="exam" class="ghost">Exam only</button>
+      <button id="stopBtn" class="danger ghost">■ Stop</button>
+      <span id="status" class="status muted"></span>
+    </div>
+    <div id="transcript" class="transcript" aria-live="polite"></div>
+    <form id="talkForm" class="talk">
+      <select id="talkTo" aria-label="Talk to">
+        <option value="student">Talk to student</option>
+        <option value="teacher">Talk to teacher</option>
+      </select>
+      <input id="talkText" placeholder="Ask the student anything, or tell the teacher what to focus on…" autocomplete="off">
+      <button>Send</button>
+    </form>
+  </section>
+
+  <aside class="side">
+    <div class="card">
+      <h3>Student</h3>
+      <div id="studentInfo"></div>
+    </div>
+    <div class="card">
+      <h3>Report card <span class="muted small" id="passMark"></span></h3>
+      <div id="reportCard"></div>
+    </div>
+    <div class="card">
+      <h3>Teacher & subjects</h3>
+      <label>Teacher behaviour
+        <select id="cfgPersona"></select>
+      </label>
+      <textarea id="cfgCustom" rows="3" placeholder="Describe a custom teacher personality…" hidden></textarea>
+      <div id="cfgSubjects" class="picker"></div>
+      <button id="saveCfg" class="ghost">Save settings</button>
+    </div>
+    <div class="card">
+      <h3>Notebook</h3>
+      <div id="notebookStats" class="muted small"></div>
+      <select id="nbSubject" aria-label="Notebook subject"></select>
+      <div id="notebook" class="notebook"></div>
+    </div>
+    <button id="deleteRoom" class="danger ghost small">Delete classroom</button>
+  </aside>
+</main>
+
+<dialog id="newDialog">
+  <form id="newForm" method="dialog">
+    <h2>New classroom</h2>
+    <label>Classroom name <input name="name" value="My Classroom" required></label>
+    <label>Student name <input name="student_name" value="Ada" required></label>
+    <fieldset>
+      <legend>Student model (≤ <span class="maxb">27</span>B — this is the AI that learns)</legend>
+      <div class="row">
+        <select name="s_backend">
+          <option value="ollama">Ollama</option>
+          <option value="openai">OpenAI-compatible (vLLM, llama.cpp, LM Studio)</option>
+          <option value="mock">Mock (offline demo)</option>
+        </select>
+        <input name="s_model" value="qwen2.5:14b" placeholder="model name">
+      </div>
+      <div class="row">
+        <input name="s_base_url" placeholder="Base URL (optional)">
+        <input name="s_params" type="number" step="0.1" min="0.1" max="27.9" placeholder="Size in B (if not in name)">
+      </div>
+    </fieldset>
+    <fieldset>
+      <legend>Teacher model</legend>
+      <div class="row">
+        <select name="t_backend">
+          <option value="ollama">Ollama</option>
+          <option value="openai">OpenAI-compatible</option>
+          <option value="anthropic">Anthropic Claude</option>
+          <option value="mock">Mock (offline demo)</option>
+        </select>
+        <input name="t_model" value="gemma3:27b" placeholder="model name">
+      </div>
+      <div class="row">
+        <input name="t_base_url" placeholder="Base URL (optional)">
+        <input name="t_api_key" type="password" placeholder="API key (optional)">
+      </div>
+      <label>Teacher behaviour <select name="persona" id="newPersona"></select></label>
+      <textarea name="custom_style" rows="2" placeholder="Custom teacher personality…" hidden></textarea>
+    </fieldset>
+    <fieldset>
+      <legend>Subjects (must score ≥ pass mark in every one to move up)</legend>
+      <div id="newSubjects" class="picker"></div>
+    </fieldset>
+    <div class="row">
+      <label>Questions per exam <input name="questions_per_exam" type="number" min="3" max="30" value="10"></label>
+      <label>Pass mark % <input name="pass_mark" type="number" min="50" max="100" value="90"></label>
+      <label>Attempts per class <input name="max_attempts" type="number" min="1" max="20" value="5"></label>
+    </div>
+    <p id="newError" class="error"></p>
+    <div class="row end">
+      <button type="button" class="ghost" id="cancelNew">Cancel</button>
+      <button type="submit" id="createBtn">Create</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
