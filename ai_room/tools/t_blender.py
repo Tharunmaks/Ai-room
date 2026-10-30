@@ -820,16 +820,18 @@ def _build(ctx, scene, out=None):
 reg("blender_build_script", "Write the Blender Python (bpy) script for a scene. Run it with `blender -b -P scene.py`, or paste it into Blender's Scripting tab.", B, "scene:str=scene, out:str?", _build, ctx=True, risk="files", produces="script", tags=("python", "bpy", "automation"))
 
 
+def _framed(sc: dict) -> list:
+    """Meshes to show in a preview: everything except the big ground plane, so the objects fill the picture."""
+    pairs = list(zip(sc["objects"], scene_meshes(sc)))
+    keep = [m for o, m in pairs if not (o["name"] == "Ground" and len(pairs) > 1)]
+    if not keep:
+        raise ToolError("the scene has no previewable objects yet")
+    return keep
+
+
 def _preview(ctx, scene, out, yaw, pitch, w, h, png):
     sc = load_scene(ctx, scene)
-    ms = scene_meshes(sc)
-    if not ms:
-        raise ToolError("the scene has no previewable objects yet")
-    ms = [m for m in ms if len(m.v) > 4]
-    if sc["objects"] and sc["objects"][0]["name"] == "Ground":  # keep the ground out of the framing
-        ground, ms = ms[0], ms[1:]
-        if not ms:
-            ms = [ground]
+    ms = _framed(sc)
     o = ctx.path(out or f"renders/{scene}_preview.{'png' if png else 'svg'}")
     bg = "#%02x%02x%02x" % tuple(round(min(1, c) ** (1 / 2.2) * 255 * .6 + 90) for c in sc["world"]["color"])
     if png:
@@ -844,10 +846,7 @@ reg("blender_preview_svg", "Quick SVG picture of a scene using the built-in soft
 
 
 def _gif(ctx, scene, out, frames, width, height):
-    sc = load_scene(ctx, scene)
-    ms = [m for m in scene_meshes(sc) if len(m.v) > 4]
-    if sc["objects"] and sc["objects"][0]["name"] == "Ground" and len(ms) > 1:
-        ms = ms[1:]
+    ms = _framed(load_scene(ctx, scene))
     ims = [mesh.render_pil(ms, 360 * i / frames, 25, (width, height)) for i in range(min(frames, 60))]
     o = ctx.path(out or f"renders/{scene}_turntable.gif")
     ims[0].save(o, save_all=True, append_images=ims[1:], duration=70, loop=0, optimize=True)

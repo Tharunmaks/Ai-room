@@ -343,7 +343,7 @@ def project(m: Mesh, yaw=35.0, pitch=28.0, size=(640, 480), zoom=1.0, extra: lis
             n = _norm(_cross(_sub(q[1], q[0]), _sub(q[2], q[0])))
             lam = abs(_dot(n, light))
             depth = sum(p[1] for p in q) / 3
-            scale = min(size) * 0.42 / rad * zoom
+            scale = min(size) * 0.5 / rad * zoom
             xy = [(size[0] / 2 + p[0] * scale, size[1] / 2 - p[2] * scale) for p in q]
             k = 0.35 + 0.65 * lam
             polys.append((depth, xy, tuple(min(255, int(c * k)) for c in rgb)))

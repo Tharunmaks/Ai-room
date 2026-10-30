@@ -5,4 +5,4 @@ notes, asking questions and re-reading its notebook. The teacher is not a model 
 it is made of exact problem generators, a textbook library and question banks.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

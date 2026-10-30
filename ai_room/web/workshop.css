@@ -1,0 +1,31 @@
+/* ───────────── Workshop ───────────── */
+.mono { font-family: var(--mono); }
+.err-text { color: var(--bad); }
+.ws-hero { display: grid; gap: 22px; grid-template-columns: minmax(0, 1.6fr) minmax(260px, 1fr); align-items: start; position: relative; overflow: hidden; padding: 22px; }
+.ws-hero::before { content: ""; position: absolute; inset: -40% -10% auto auto; width: 520px; height: 520px; background: radial-gradient(closest-side, color-mix(in srgb, var(--accent) 26%, transparent), transparent); pointer-events: none; }
+.ws-prompt, .ws-controls { position: relative; display: flex; flex-direction: column; gap: 12px; }
+.ws-prompt textarea { min-height: 112px; font-family: var(--sans); font-size: 16px; line-height: 1.5; padding: 14px 16px; border-radius: 16px; }
+@media (max-width: 900px) { .ws-hero { grid-template-columns: 1fr; } }
+.ws-console { margin-top: 18px; }
+.ws-steps { display: flex; flex-direction: column; gap: 10px; max-height: 62vh; overflow-y: auto; padding-right: 4px; }
+.ws-step { display: flex; gap: 12px; padding: 12px 14px; border-radius: 14px; border: 1px solid var(--line); background: color-mix(in srgb, var(--solid) 55%, transparent); animation: rise .25s ease; }
+.ws-step.pending { border-color: color-mix(in srgb, var(--accent) 55%, transparent); } .ws-step.ok { border-color: color-mix(in srgb, var(--good) 38%, transparent); } .ws-step.bad { border-color: color-mix(in srgb, var(--bad) 45%, transparent); }
+.ws-ic { width: 32px; height: 32px; border-radius: 10px; display: grid; place-items: center; background: var(--panel-2); flex: none; color: var(--accent); } .ws-ic .i { width: 18px; height: 18px; }
+.ws-tool { font-family: var(--mono); font-size: 13.5px; color: var(--accent-2); }
+.ws-thought { font-style: italic; color: var(--ink-2); font-size: 14px; margin: 2px 0 4px; }
+.ws-args, .ws-obs { font-family: var(--mono); font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere; background: color-mix(in srgb, var(--solid) 80%, #000); padding: 9px 11px; border-radius: 10px; margin: 6px 0 0; }
+.ws-obs { max-height: 180px; overflow: auto; } details > summary { cursor: pointer; }
+.ws-files { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; align-items: center; }
+.ws-thumb { height: 92px; max-width: 170px; object-fit: cover; border-radius: 10px; border: 1px solid var(--line-2); background: #fff; display: block; transition: transform .15s; } .ws-thumb:hover { transform: scale(1.04); } .ws-thumb.big { height: 150px; max-width: 260px; }
+.ws-final { margin-top: 14px; padding: 16px 18px; border-radius: 16px; border: 1px solid color-mix(in srgb, var(--good) 40%, transparent); background: color-mix(in srgb, var(--good) 8%, var(--panel)); }
+.ws-gallery { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); }
+.ws-file { margin: 0; border-radius: 16px; overflow: hidden; border: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; transition: transform .15s, box-shadow .2s; } .ws-file:hover { transform: translateY(-2px); box-shadow: var(--shadow-sm); }
+.ws-media { aspect-ratio: 4 / 3; background: repeating-conic-gradient(color-mix(in srgb, var(--solid) 70%, #000) 0 25%, color-mix(in srgb, var(--solid) 90%, #fff) 0 50%) 0 0 / 18px 18px; display: grid; place-items: center; overflow: hidden; flex-direction: column; }
+.ws-media img, .ws-media video { width: 100%; height: 100%; object-fit: contain; } .ws-media audio { width: 92%; } .ws-icon { font-size: 54px; }
+.ws-file figcaption { padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 3px; min-width: 0; } .ws-file figcaption b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13.5px; }
+.ws-tool-card { padding: 14px; border-radius: 16px; border: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; gap: 8px; transition: border-color .15s, transform .15s; min-width: 0; } .ws-tool-card:hover { border-color: var(--line-2); transform: translateY(-1px); }
+.ws-tool-card.dim { opacity: .65; } .ws-tool-card .mono { overflow-wrap: anywhere; }
+.ws-perm { padding: 10px 12px; border-radius: 13px; border: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; gap: 4px; }
+.ws-recipe { display: flex; flex-direction: column; }
+input[type=password] { width: 100%; padding: 10px 13px; border-radius: 12px; border: 1px solid var(--line-2); background: color-mix(in srgb, var(--solid) 70%, transparent); color: var(--ink); }
+input[type=password]:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 28%, transparent); }

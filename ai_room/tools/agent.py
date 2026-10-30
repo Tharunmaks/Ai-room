@@ -221,7 +221,22 @@ class RulePlanner(LLM):
         if len(done) < len(plan):
             return json.dumps(plan[len(done)])
         last_obs = [m.content for m in messages if m.role == "user" and m.content.startswith("OBSERVATION")]
-        return json.dumps({"final": "Done. " + (last_obs[-1][13:240] if last_obs else "")})
+        return json.dumps({"final": self.summary(last_obs[-1][13:] if last_obs else "")})
+
+    @staticmethod
+    def summary(obs: str) -> str:
+        files = re.findall(r"\(files created: ([^)]*)\)", obs)
+        body = obs.split("\n(files created")[0].strip()
+        try:
+            j = json.loads(body)
+        except ValueError:
+            j = None
+        if isinstance(j, dict) and "steps" in j:
+            ok = sum(1 for s in j["steps"] if s.get("ok"))
+            return f"Ran the “{j.get('recipe')}” recipe: {ok} of {len(j['steps'])} steps succeeded. Files: " + (", ".join(j.get("files", [])[:10]) or "none") + "."
+        if body.startswith("ERROR"):
+            return "That did not work: " + body[7:240]
+        return "Done. " + body[:240] + (f" Files: {files[-1]}." if files else "")
 
     @staticmethod
     def plan(goal: str, g: str) -> list[dict]:

@@ -37,7 +37,7 @@ def get(ctx: Context, url: str, params: dict | None = None, headers: dict | None
     if urllib.parse.urlparse(url).scheme != "https":
         raise ToolError("only https:// addresses are allowed")
     try:
-        r = client(ctx).get(url, params=params, headers=headers)
+        r = client(ctx).get(url, params=params, headers={"User-Agent": UA, "Accept": "application/json", **(headers or {})})
     except httpx.HTTPError as e:
         raise ToolError(f"network error: {e.__class__.__name__}: {e}")
     if r.status_code == 429:
@@ -66,7 +66,7 @@ def post(ctx: Context, url: str, data=None, json_=None, headers=None):
     if urllib.parse.urlparse(url).scheme != "https":
         raise ToolError("only https:// addresses are allowed")
     try:
-        r = client(ctx).post(url, data=data, json=json_, headers=headers)
+        r = client(ctx).post(url, data=data, json=json_, headers={"User-Agent": UA, **(headers or {})})
     except httpx.HTTPError as e:
         raise ToolError(f"network error: {e.__class__.__name__}: {e}")
     if r.status_code >= 400:
@@ -156,7 +156,7 @@ def _download(ctx, url, path, hosts):
     if u.scheme != "https" or (hosts and not any(u.netloc == h or u.netloc.endswith("." + h) for h in hosts)):
         raise ToolError(f"downloads are only allowed from: {', '.join(hosts)}")
     try:
-        r = client(ctx).get(url, headers={"Accept": "*/*"})
+        r = client(ctx).get(url, headers={"User-Agent": UA, "Accept": "*/*"})
     except httpx.HTTPError as e:
         raise ToolError(f"network error: {e}")
     if r.status_code != 200:

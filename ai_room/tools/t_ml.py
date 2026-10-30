@@ -240,13 +240,13 @@ def predict_one(m, x):
     raise ToolError(f"cannot predict with model type '{t}'")
 
 
-def metrics(true, pred):
+def metrics(true, pred, regression=None):
+    """Regression scores (R², RMSE…) when the model predicts numbers; accuracy and a confusion table when it predicts labels."""
     n = len(true)
-    nums = all(isinstance(v, (int, float)) for v in true) and all(isinstance(v, (int, float)) for v in pred)
     try:
         t = [float(v) for v in true]
         pr = [float(v) for v in pred]
-        if len(set(t)) > 10 or any(v != int(v) for v in t):
+        if regression or (regression is None and (len(set(t)) > 10 or any(v != int(v) for v in t))):
             mean = sum(t) / n
             ss = sum((a - mean) ** 2 for a in t) or 1
             return {"n": n, "mse": round(sum((a - b) ** 2 for a, b in zip(t, pr)) / n, 6), "rmse": round(math.sqrt(sum((a - b) ** 2 for a, b in zip(t, pr)) / n), 6), "mae": round(sum(abs(a - b) for a, b in zip(t, pr)) / n, 6), "r2": round(1 - sum((a - b) ** 2 for a, b in zip(t, pr)) / ss, 6)}
@@ -304,7 +304,7 @@ def train(ctx, kind, name, X, y, csv_path, target, **kw):
     m["features"] = feats
     if kind != "kmeans":
         pred = [predict_one(m, r) for r in Xte]
-        score = metrics(yte, pred)
+        score = metrics(yte, pred, regression=numeric)
     else:
         score = {"inertia": round(sum(min(sum((a - b) ** 2 for a, b in zip(r, c)) for c in m["centroids"]) for r in X), 4)}
     path = save_model(ctx, name, m)
@@ -379,9 +379,9 @@ def _cv(ctx, path, target, kind, folds):
         mu, sd = mean_std(Xtr)
         m = {"type": kind, **({"tree": fit_tree(Xtr, ytr, 4)} if kind == "tree" else fit_logistic(Xtr, ytr) if kind == "logistic" else {"w": fit_linear(Xtr, [float(v) for v in ytr])} if kind == "linear" else {"k": 3, "X": Xtr, "y": ytr, "mu": mu, "sd": sd, "numeric": False} if kind == "knn" else {})}
         if kind == "linear":
-            sc = metrics(yte, [predict_one(m, r) for r in Xte]).get("r2", 0)
+            sc = metrics(yte, [predict_one(m, r) for r in Xte], regression=True).get("r2", 0)
         else:
-            sc = metrics(yte, [predict_one(m, r) for r in Xte])["accuracy"]
+            sc = metrics(yte, [predict_one(m, r) for r in Xte], regression=False)["accuracy"]
         scores.append(round(sc, 4))
     return {"folds": scores, "mean": round(sum(scores) / len(scores), 4)}
 
@@ -456,7 +456,7 @@ def _curve(ctx, path, target, kind):
         Xtr, ytr = [X[i] for i in tr], [y[i] for i in tr]
         Xte, yte = [X[i] for i in te], [y[i] for i in te]
         m = {"type": "tree", "tree": fit_tree(Xtr, ytr, 4)} if kind == "tree" else {"type": "linear", "w": fit_linear(Xtr, [float(v) for v in ytr])}
-        s = metrics(yte, [predict_one(m, r) for r in Xte])
+        s = metrics(yte, [predict_one(m, r) for r in Xte], regression=kind != "tree")
         out.append({"train_size": len(tr), "score": s.get("accuracy", s.get("r2"))})
     return out
 

@@ -65,6 +65,53 @@ Textbook-only subjects fetch their books automatically the first time they are n
 
 `ai-room serve` runs fine, but a 14B–27B student model does not fit on a phone. Point the student at an OpenAI-compatible server on your computer (`OPENAI_BASE_URL`, or the "Server address" box in the wizard), or use the simulated student to explore. Clone the repo first, then `cd` into it before `pip install -e .`.
 
+## 🛠 The Workshop — 1,200+ tools the student can use
+
+Open **Workshop** in the app, type a goal ("build a 3D snowman in Blender and make an Instagram post about it"), and the student searches the toolbox, calls tools one at a time, reads what came back, and keeps going until the files exist. Everything it makes lands in a workspace folder with a gallery (images, videos, audio, 3D, notebooks).
+
+| Area | Tools | Examples |
+|---|---:|---|
+| Calculator, maths, statistics, units, finance, physics, chemistry | 220 | `calculator`, `convert_units`, `solve_quadratic`, `loan_payment`, `molar_mass`, `matrix_inverse` |
+| Text, data, dates, colours, encoding, hashing | 151 | `csv_summary`, `json_get`, `hash_sha256`, `contrast_ratio`, `age_from_birthdate` |
+| Python sandbox, files, archives | 32 | `run_python`, `write_file`, `zip_files`, `read_pdf_text` |
+| Charts (SVG) | 15 | `bar_chart`, `plot_function`, `heatmap`, `timeline` |
+| Images (Pillow) | 148 | 17 filters, 24 effects, 20 social-media sizes, text cards, memes, certificates, 18 generative-art makers |
+| Video & audio (ffmpeg) | 134 | convert, trim, GIFs, 27 video effects, reel/story/Shorts fitting, slide videos, 22 audio effects, melodies |
+| 3D meshes (pure Python) | 38 | 22 primitives, OBJ/STL/PLY/glTF export, volume & watertight checks, software renderer, turntable GIFs |
+| **Blender** | 214 | scenes as files; 31 shapes, 33 materials, 37 modifiers, lights, 10 cameras, animation, 32 ready-made builds (house, robot, car, solar system…), `bpy` script generation, real rendering |
+| Colab & Kaggle | 62 | 25 starter notebooks for each, datasets, competitions, kernels |
+| Wikimedia, web, 45 free public APIs | 91 | Wikipedia/Wiktionary/Commons/Wikidata, weather, countries, books, papers, exchange rates |
+| YouTube, Instagram, GitHub, Hugging Face | 52 | official APIs only |
+| Machine learning & algorithms | 52 | real training (regression, trees, k-NN, small neural net, naive Bayes, k-means), genetic algorithms, Sudoku, graphs |
+| Automation (recipes) | 7 | saved pipelines; 13 built in, e.g. `instagram_post_pack`, `blender_showcase`, `youtube_launch_kit` |
+
+**Honest counts.** 1,216 tools are registered; in a typical install 1,181 are ready. The rest say exactly what they need — `blender` / `kaggle` / `yt-dlp` on your PATH, or a key such as `YOUTUBE_API_KEY`. The Workshop shows *needs setup* instead of failing silently. Many tools in a family share code (for example 33 materials, 25 notebook templates × 2 sites, 17 filters): the number counts distinct things the student can ask for, not 1,200 different algorithms.
+
+### How the student uses them
+
+Small models are unreliable at native function-calling, so the protocol is plain JSON in text — one action per turn: `{"tool": …, "args": {…}}`, `{"search": …}` or `{"final": …}`. Each turn the model sees its goal, its last steps, and a **shortlist of tools retrieved with BM25** from all 1,200 (it never reads the whole list). Wrong tool names get "did you mean…", errors are shown to the model so it can repair the call, identical repeated calls are interrupted, and a run stops at its step limit. The model must be ≤ 27B like everywhere else. The *Demo planner* is a keyword rule-set — **not an AI** — so you can explore the Workshop without a model.
+
+### Automation: recipes
+
+A recipe is a saved list of tool calls with `{{parameters}}` and `{{step1}}`-style chaining — it runs with no AI at all. Run one from the **Recipes** tab, run it for a whole list (`recipe_run_batch`), or finish a student run and **save its successful steps as a recipe** so the same job can be repeated for free.
+
+### Blender: what is real and what is not
+
+The Blender tools edit a **scene file** (`scenes/<name>.json`) in pure Python, so they always work. `blender_build_script` writes a `bpy` script; `blender_render` / `blender_run_script` run **real Blender** when it is installed (`blender -b -P …`) and show as *needs setup* until then. Without Blender you still get a software-rendered **preview** (shapes, colours, arrays, mirrors — not lights, glass or subdivision). The generated scripts are compile-checked and executed against a fake `bpy` in the tests; they have **not** been run in a real Blender here, so expect to adjust a few settings across Blender versions (the script handles the EEVEE and Principled-BSDF renames of 4.x).
+
+### "Training" — what it means here
+
+*Local* training tools really change model weights, but only on small data in pure Python (`train_logistic`, `train_tree`, `train_mlp`, `train_text_classifier`, k-means…). Heavy GPU training is **not** run by this app: the Colab and Kaggle tools write ready-to-upload notebooks (LoRA fine-tuning, PyTorch, diffusers, Whisper…). This is separate from the classroom, where the student's own weights never change.
+
+### Safety defaults
+
+* **Permission levels:** `safe` (pure computation), `files` (workspace only), `network` (public pages and APIs) are on. **`exec`** (the student's own Python/shell/Blender code) and **`post`** (publishing to YouTube, Instagram or GitHub) are **off** until you switch them on in *Permissions & keys*. A blocked call tells the student why.
+* **Official APIs only.** YouTube uses the Data API v3 with your key; Instagram uses the Graph API for a Business/Creator account. No passwords, no scraping of logged-in sites. Colab has no public API, so the tools write notebooks. `yt-dlp` is optional and for content you are allowed to download.
+* Keys are stored in a file readable only by you and are never sent back to the browser.
+* The workspace is a folder: tools cannot read or write outside it, zip extraction refuses `../`, page fetching refuses local/private addresses, and files are served with a sandboxing `Content-Security-Policy` so a generated SVG can't run scripts.
+* `run_python` runs in a separate process with a timeout, **not** a real sandbox — use a container or VM if you enable `exec` with an untrusted model.
+* There is still **no login**: keep the server on `127.0.0.1` unless you add your own protection.
+
 ## The 27B limit
 
 Larger students are refused. The size comes from Ollama (`/api/show`) or from the model name (`qwen2.5:14b`, `gemma3:27b`); Mixture-of-Experts models count their *total* parameters (`8x7b` = 56B), and a model whose size can't be determined is refused unless you declare it. Models reported as slightly over 27B (e.g. Gemma 3 27B reports 27.4B) are accepted.
@@ -86,7 +133,7 @@ Larger students are refused. The size comes from Ollama (`/api/show`) or from th
 * **Templated problems.** Generated problems vary numbers and wording, but come from templates (192 families); a student can master a family by learning its method — which is the point.
 * **Free-text answers are not graded** (that would need a model). Questions are numeric, multiple-choice, fill-in-the-blank or code.
 * **Code answers run on your machine** in a separate Python process with a timeout, in an empty folder. That is not a real sandbox: run AI Room in a container or VM if you use untrusted models.
-* **Server exposure.** The app binds to `127.0.0.1` by default; it has no login. URL import refuses private addresses unless `AI_ROOM_ALLOW_PRIVATE_URLS=1`.
+* **Server exposure.** The app binds to `127.0.0.1` by default; it has no login (see the Workshop safety notes — it can write files and, if you allow it, run code). URL import refuses private addresses unless `AI_ROOM_ALLOW_PRIVATE_URLS=1`.
 
 ## Project layout
 
@@ -105,7 +152,12 @@ ai_room/
   memory.py            notebook, exam records, transcript
   grading.py           answer extraction and matching (numeric, MCQ, cloze, exact, code tests)
   server.py  cli.py    FastAPI app and command line          web/   the single-page UI (no build step)
-tests/                 ~130 offline tests
+  workshop_api.py      Workshop HTTP API (tools, runs, files, recipes, permissions)
+  tools/
+    registry.py        Tool / Param / Context, BM25 tool search, permission + path-escape guards, call() that never raises
+    t_math.py t_text.py t_files.py t_svg.py t_image.py t_video.py t_mesh.py t_blender.py t_web.py t_ml.py   the tool families
+    recipes.py         automation pipelines          agent.py   the Workshop loop and the rule-based demo planner
+tests/                 ~190 offline tests
 ```
 
 Run the tests with `pip install -e ".[dev]" && pytest`.

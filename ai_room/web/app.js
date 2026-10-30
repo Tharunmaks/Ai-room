@@ -8,7 +8,7 @@ const S = {
 };
 const VIEWS = [
   ["classroom", "Classroom", "classroom"], ["subjects", "Subjects", "subjects"], ["teacher", "Teacher", "teacher"],
-  ["library", "Library", "library"], ["notebook", "Notebook", "notebook"], ["report", "Report", "report"],
+  ["workshop", "Workshop", "tools"], ["library", "Library", "library"], ["notebook", "Notebook", "notebook"], ["report", "Report", "report"],
 ];
 const SUBJ = (k) => META.subjects.find((s) => s.key === k);
 const fmtStatus = (r) => (r.busy && r.status === "idle" ? "⏳ Starting…" : r.busy ? `${/exam/i.test(r.status) ? "📝" : /lesson/i.test(r.status) ? "📖" : /fetch|textbook/i.test(r.status) ? "📚" : "⏳"} ${r.status}` : "");
@@ -91,6 +91,7 @@ function render() {
   $$("#nav button").forEach((b) => b.classList.toggle("on", b.dataset.view === S.view));
   const t = VIEWS.find((v) => v[0] === S.view); $("#pageTitle").textContent = S.view === "report" ? "Report card" : t ? t[1] : "AI Room";
   const page = $("#page");
+  if (S.view === "workshop") { page.innerHTML = `<div class="view" id="ws"></div>`; renderWorkshop(); return; }
   if (S.view === "library") { page.innerHTML = `<div class="view" id="lib"></div>`; renderLibrary(); return; }
   if (!S.room) { page.innerHTML = `<div class="view">${welcomeHTML()}</div>`; return; }
   const fn = { classroom: renderClassroom, subjects: renderSubjects, teacher: renderTeacher, notebook: renderNotebook, report: renderReport }[S.view];
