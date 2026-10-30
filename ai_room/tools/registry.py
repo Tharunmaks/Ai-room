@@ -59,6 +59,7 @@ class Tool:
     needs: tuple[str, ...] = ()   # "py:PIL", "bin:ffmpeg", "env:YOUTUBE_API_KEY", "net"
     tags: tuple[str, ...] = ()
     produces: str = ""            # "image" | "video" | "model3d" | "audio" | "text" | "file"
+    timeout: float = 0.0          # longer limit for slow tools (rendering, encoding); 0 = the context's limit
 
     def signature(self) -> str:
         args = ", ".join(f"{p.name}{'' if p.required else '?'}:{p.type}" for p in self.params)
@@ -261,7 +262,8 @@ def call(name: str, args: dict | None, ctx: Context) -> dict:
                 raise ToolError(f"argument '{p.name}' must be one of {list(p.choices)}")
             kwargs[p.name] = v
         before = len(ctx.artifacts)
-        out = _run_with_timeout(lambda: t.fn(ctx, **kwargs), ctx.timeout)
+        limit = max(ctx.timeout, t.timeout)
+        out = _run_with_timeout(lambda: t.fn(ctx, **kwargs), limit)
         text = out if isinstance(out, str) else json.dumps(out, default=str, ensure_ascii=False)
         if len(text) > MAX_RESULT:
             text = text[:MAX_RESULT] + f"… [truncated, {len(text)} characters]"
@@ -269,7 +271,7 @@ def call(name: str, args: dict | None, ctx: Context) -> dict:
     except ToolError as e:
         return {"ok": False, "error": str(e), "artifacts": []}
     except TimeoutError:
-        return {"ok": False, "error": f"'{name}' took longer than {ctx.timeout:g}s and was stopped.", "artifacts": []}
+        return {"ok": False, "error": f"'{name}' took longer than {limit:g}s and was stopped.", "artifacts": []}
     except Exception as e:  # a tool bug or bad input must never crash the student's session
         return {"ok": False, "error": f"{e.__class__.__name__}: {e}", "artifacts": []}
 
@@ -323,4 +325,4 @@ def reg(name: str, desc: str, category: str, sig: str, fn: Callable, *, ctx: boo
     """Register a plain function. With ctx=True it receives the Context first."""
     wrapped = fn if ctx else (lambda _ctx, /, **kw: fn(**kw))
     return add(Tool(name, meta.pop("title", "") or name.replace("_", " ").capitalize(), desc, category, parse_sig(sig), wrapped,
-                    meta.pop("risk", "safe"), tuple(meta.pop("needs", ())), tuple(meta.pop("tags", ())), meta.pop("produces", "")))
+                    meta.pop("risk", "safe"), tuple(meta.pop("needs", ())), tuple(meta.pop("tags", ())), meta.pop("produces", ""), meta.pop("timeout", 0.0)))
