@@ -112,6 +112,26 @@ The Blender tools edit a **scene file** (`scenes/<name>.json`) in pure Python, s
 * `run_python` runs in a separate process with a timeout, **not** a real sandbox — use a container or VM if you enable `exec` with an untrusted model.
 * There is still **no login**: keep the server on `127.0.0.1` unless you add your own protection.
 
+## 🔧 Real training on a CPU (`ai-room train`)
+
+The classroom itself never changes the student's weights. If you want weights that **actually change**, use the trainer. It fine-tunes a small open model with LoRA on your CPU, using problems from the teacher's exact generators. Every training answer is computed by code, and a test checks that each one is graded correct. Before and after training, the model sits the **same held-out exam** (no overlap with the training problems), graded by the classroom's own grader.
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -e ".[train]"
+ai-room train --model HuggingFaceTB/SmolLM2-135M-Instruct --subjects math --grades 1-3 --examples 1000 --epochs 2
+ai-room ask data/trained/model/merged "What is 48 ÷ 6?"
+```
+
+**Measured result** (4-core Xeon, no GPU, the command above): held-out exam **5% → 47%**, in 12.9 minutes of training (250 steps, loss 0.64 → 0.10). By topic after training: divisibility 71%, multiplication/division 62%, percentages 57%, fractions 54%, addition/subtraction 37%, order of operations 10%.
+
+What to expect:
+* **It is real, and it is small.** A 135M model went from almost never answering in the right form to answering about half correctly. It still makes plenty of mistakes; a spot check of "48 ÷ 6" after training gave a wrong answer.
+* **Bigger models learn more but cost much more.** A 360M model is about 3× slower per step; 1.5B is the practical ceiling on a CPU. A 7B model needs about 30 GB of RAM and days. 27B is not feasible on a CPU, so use the Colab/Kaggle notebooks for those.
+* **Only exact-practice subjects** can be used as training data, because only they have answers computed by code.
+* `--dtype bf16` exists, but on the test CPU it was no faster than fp32 (4.08 vs 4.06 s/step), so fp32 is the default.
+* The output is a Hugging Face model folder (`merged/`) plus a small LoRA adapter. To use it in Ollama, convert it to GGUF with llama.cpp's `convert_hf_to_gguf.py`. That conversion step was not tested here.
+
 ## The 27B limit
 
 Larger students are refused. The size comes from Ollama (`/api/show`) or from the model name (`qwen2.5:14b`, `gemma3:27b`); Mixture-of-Experts models count their *total* parameters (`8x7b` = 56B), and a model whose size can't be determined is refused unless you declare it. Models reported as slightly over 27B (e.g. Gemma 3 27B reports 27.4B) are accepted.
@@ -157,6 +177,7 @@ ai_room/
     registry.py        Tool / Param / Context, BM25 tool search, permission + path-escape guards, call() that never raises
     t_math.py t_text.py t_files.py t_svg.py t_image.py t_video.py t_mesh.py t_blender.py t_web.py t_ml.py   the tool families
     recipes.py         automation pipelines          agent.py   the Workshop loop and the rule-based demo planner
+  train_cpu.py         real LoRA fine-tuning on a CPU with a before/after exam (`ai-room train`, `ai-room ask`)
 tests/                 ~190 offline tests
 ```
 
