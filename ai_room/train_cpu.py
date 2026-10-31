@@ -252,8 +252,12 @@ def train(cfg: TrainConfig, log: Callable[[str], None] = print) -> dict:
 
 def ask(model_dir: str, question: str, max_new: int = 128) -> str:
     """Ask a saved (merged) model a question."""
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except ImportError as e:
+        raise SystemExit(f"Asking a trained model needs PyTorch and transformers ({e}). They are not available on Termux; "
+                         "run this on a computer with: pip install torch transformers")
     tok = AutoTokenizer.from_pretrained(model_dir)
     model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32)
     enc = tok(_chat(tok, PROMPT.format(question=question, options="")), return_tensors="pt", add_special_tokens=False)
