@@ -111,7 +111,41 @@ def main(argv: list[str] | None = None) -> None:
     bk.add_argument("--subject")
     bk.add_argument("--library", default="data/library.db")
 
+    t = sub.add_parser("train", help="really fine-tune a small open model on the CPU (LoRA), with a before/after exam")
+    t.add_argument("--model", default="HuggingFaceTB/SmolLM2-360M-Instruct", help="Hugging Face model id or local folder")
+    t.add_argument("--subjects", default="math", help="comma-separated subjects with exact problem generators")
+    t.add_argument("--grades", default="1-3", help="classes, e.g. 1-3 or 2,5")
+    t.add_argument("--examples", type=int, default=800, help="training problems (answers computed by code)")
+    t.add_argument("--eval", type=int, default=100, help="held-out exam questions (0 to skip)")
+    t.add_argument("--epochs", type=int, default=2)
+    t.add_argument("--batch-size", type=int, default=8)
+    t.add_argument("--lr", type=float, default=2e-4)
+    t.add_argument("--lora-r", type=int, default=16)
+    t.add_argument("--max-minutes", type=float, default=0, help="stop training after this long (0 = no limit)")
+    t.add_argument("--threads", type=int, default=0, help="CPU threads (0 = all)")
+    t.add_argument("--dtype", choices=["fp32", "bf16"], default="fp32")
+    t.add_argument("--seed", type=int, default=7)
+    t.add_argument("--out", default="data/trained/model")
+
+    q = sub.add_parser("ask", help="ask a model saved by `ai-room train` a question")
+    q.add_argument("model_dir", help="e.g. data/trained/model/merged")
+    q.add_argument("question")
+
     a = p.parse_args(argv)
+
+    if a.cmd == "train":
+        from .train_cpu import TrainConfig, parse_grades, train
+        rep = train(TrainConfig(model=a.model, subjects=[x.strip() for x in a.subjects.split(",") if x.strip()], grades=parse_grades(a.grades), examples=a.examples,
+                                eval_examples=a.eval, skip_eval=a.eval == 0, epochs=a.epochs, batch_size=a.batch_size, lr=a.lr, lora_r=a.lora_r, lora_alpha=2 * a.lora_r,
+                                max_minutes=a.max_minutes, threads=a.threads, dtype=a.dtype, seed=a.seed, out=a.out))
+        if "before" in rep:
+            print(f"\nHeld-out exam: {rep['before']['accuracy']:.1%} before → {rep['after']['accuracy']:.1%} after training "
+                  f"({rep['train']['steps']} steps, {rep['train']['seconds'] / 60:.1f} min, loss {rep['train']['first_loss']} → {rep['train']['last_loss']}).")
+        return
+    if a.cmd == "ask":
+        from .train_cpu import ask
+        print(ask(a.model_dir, a.question))
+        return
 
     if a.cmd == "serve":
         import uvicorn

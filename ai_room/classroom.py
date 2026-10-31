@@ -11,7 +11,7 @@ from typing import Callable
 
 from .agents import Student
 from .curriculum import DEFAULT_SUBJECTS, NUM_GRADES, PASS_MARK, SUBJECTS, difficulty
-from .grading import cloze_match, exact_match, extract_code, extract_final, mcq_match, numeric_match, run_code_tests
+from .grading import extract_code, grade_question, run_code_tests
 from .llm import LLM, check_student_size, make_llm
 from .memory import Store
 from .teacher import PRESETS, Library, NoCourseMaterial, Teacher, style_from
@@ -177,19 +177,12 @@ class Classroom:
 
     def _grade_one(self, q: dict, reply: str) -> tuple[float, str, str]:
         """Returns (score 0..1, what the student gave, feedback). All grading is deterministic."""
-        t = q["type"]
         feedback = q.get("explanation", "")
-        if t == "code":
+        if q["type"] == "code":
             passed, total, log = run_code_tests(extract_code(reply), list(q.get("tests", [])))
             return (passed / total if total else 0.0), f"{passed}/{total} tests passed", (log if passed < total else "") or feedback
-        given = extract_final(reply)
-        if t == "numeric":
-            ok = numeric_match(given, q["answer"], exact=False if q.get("tol") else None)
-        elif t == "mcq":
-            ok = mcq_match(given, q["answer"])
-        else:
-            ok = exact_match(given, q["answer"]) if q.get("exact") else cloze_match(given, q["answer"])
-        return float(ok), given, feedback
+        score, given = grade_question(q, reply)
+        return score, given, feedback
 
     def exam_subject(self, subject: str, attempt: int) -> dict:
         g = self.grade

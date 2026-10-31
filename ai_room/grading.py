@@ -158,3 +158,18 @@ def run_code_tests(code: str, tests: list[str], timeout: float = 10.0) -> tuple[
                 log.append(f"TIMEOUT {test}")
             passed += ok
     return passed, len(tests), "\n".join(log) or "all tests passed"
+
+
+def grade_question(q: dict, reply: str) -> tuple[float, str]:
+    """Score one reply to a generated question exactly as the classroom does. Returns (score 0..1, what was extracted)."""
+    if q["type"] == "code":
+        passed, total, _ = run_code_tests(extract_code(reply), list(q.get("tests", [])))
+        return (passed / total if total else 0.0), f"{passed}/{total} tests passed"
+    given = extract_final(reply)
+    if q["type"] == "numeric":
+        ok = numeric_match(given, q["answer"], exact=False if q.get("tol") else None)
+    elif q["type"] == "mcq":
+        ok = mcq_match(given, q["answer"])
+    else:
+        ok = exact_match(given, q["answer"]) if q.get("exact") else cloze_match(given, q["answer"])
+    return float(ok), given
