@@ -127,6 +127,23 @@ def main(argv: list[str] | None = None) -> None:
     t.add_argument("--seed", type=int, default=7)
     t.add_argument("--out", default="data/trained/model")
 
+    bo = sub.add_parser("boost", help="make a model answer better WITHOUT training (notebook, mistakes, calculator, voting) and measure it")
+    bo.add_argument("--student", required=True, help="backend:model, e.g. ollama:qwen2.5:1.5b or openai:qwen2.5-1.5b-instruct (≤27B)")
+    bo.add_argument("--base-url", help="server address, e.g. http://127.0.0.1:8080/v1 for llama.cpp")
+    bo.add_argument("--student-params", type=float, help="model size in billions if it is not in the name")
+    bo.add_argument("--subjects", default="math")
+    bo.add_argument("--grades", default="1-3")
+    bo.add_argument("--eval", type=int, default=100, help="held-out exam questions (same exam as `ai-room train` for the same seed)")
+    bo.add_argument("--study", type=int, default=300, help="worked examples the student studies into its notebook")
+    bo.add_argument("--practice", type=int, default=60, help="practice questions; each mistake becomes a notebook page")
+    bo.add_argument("--pages", type=int, default=3, help="notebook pages re-read before each question")
+    bo.add_argument("--methods", default="plain,notes,mistakes,calculator", help="stacked in order; any of plain,notes,mistakes,calculator,vote")
+    bo.add_argument("--votes", type=int, default=5)
+    bo.add_argument("--parallel", type=int, default=1, help="questions in flight at once (helps on servers that batch requests)")
+    bo.add_argument("--max-tokens", type=int, default=256)
+    bo.add_argument("--seed", type=int, default=7)
+    bo.add_argument("--out", default="data/boost/report.json")
+
     q = sub.add_parser("ask", help="ask a model saved by `ai-room train` a question")
     q.add_argument("model_dir", help="e.g. data/trained/model/merged")
     q.add_argument("question")
@@ -141,6 +158,23 @@ def main(argv: list[str] | None = None) -> None:
         if "before" in rep:
             print(f"\nHeld-out exam: {rep['before']['accuracy']:.1%} before → {rep['after']['accuracy']:.1%} after training "
                   f"({rep['train']['steps']} steps, {rep['train']['seconds'] / 60:.1f} min, loss {rep['train']['first_loss']} → {rep['train']['last_loss']}).")
+        return
+    if a.cmd == "boost":
+        from .boost import BoostConfig, run, summary_table
+        from .llm import ModelTooLargeError, check_student_size, make_llm
+        from .train_cpu import parse_grades
+        spec = _student(a.student)
+        if spec["backend"] == "demo":
+            raise SystemExit("boost needs a real model (ollama:… or openai:…); the demo student only copies the answer key")
+        llm = make_llm(spec["backend"], spec["model"], a.base_url)
+        try:
+            check_student_size(llm, a.student_params)
+        except ModelTooLargeError as e:
+            raise SystemExit(str(e))
+        rep = run(llm, BoostConfig(subjects=[x.strip() for x in a.subjects.split(",") if x.strip()], grades=parse_grades(a.grades), eval_examples=a.eval,
+                                   study_examples=a.study, practice=a.practice, pages=a.pages, votes=a.votes, methods=[m.strip() for m in a.methods.split(",") if m.strip()],
+                                   parallel=a.parallel, max_tokens=a.max_tokens, seed=a.seed, out=a.out))
+        print("\n" + summary_table(rep))
         return
     if a.cmd == "ask":
         from .train_cpu import ask

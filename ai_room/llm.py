@@ -42,6 +42,10 @@ class LLM:
     def chat(self, messages: list[Message], temperature: float = 0.7, max_tokens: int = 2048) -> str:
         raise NotImplementedError
 
+    def chat_with_usage(self, messages: list[Message], temperature: float = 0.7, max_tokens: int = 2048) -> tuple[str, dict]:
+        """The reply plus whatever token counts / timings the backend reports (empty if it reports none)."""
+        return self.chat(messages, temperature, max_tokens), {}
+
     def parameter_count_b(self) -> float | None:
         """Model size in billions of parameters, or None if unknown."""
         return None
@@ -109,6 +113,9 @@ class OllamaLLM(LLM):
         self.client = httpx.Client(timeout=timeout)
 
     def chat(self, messages, temperature=0.7, max_tokens=2048):
+        return self.chat_with_usage(messages, temperature, max_tokens)[0]
+
+    def chat_with_usage(self, messages, temperature=0.7, max_tokens=2048):
         r = self.client.post(
             f"{self.base_url}/api/chat",
             json={
@@ -119,7 +126,10 @@ class OllamaLLM(LLM):
             },
         )
         r.raise_for_status()
-        return r.json()["message"]["content"]
+        j = r.json()
+        usage = {"prompt_tokens": j.get("prompt_eval_count"), "completion_tokens": j.get("eval_count"),
+                 "prompt_seconds": (j.get("prompt_eval_duration") or 0) / 1e9 or None, "completion_seconds": (j.get("eval_duration") or 0) / 1e9 or None}
+        return j["message"]["content"], {k: v for k, v in usage.items() if v}
 
     def parameter_count_b(self):
         try:
@@ -145,6 +155,9 @@ class OpenAICompatLLM(LLM):
         self.client = httpx.Client(timeout=timeout, headers={"Authorization": f"Bearer {key}"})
 
     def chat(self, messages, temperature=0.7, max_tokens=2048):
+        return self.chat_with_usage(messages, temperature, max_tokens)[0]
+
+    def chat_with_usage(self, messages, temperature=0.7, max_tokens=2048):
         r = self.client.post(
             f"{self.base_url}/chat/completions",
             json={
@@ -155,7 +168,12 @@ class OpenAICompatLLM(LLM):
             },
         )
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"] or ""
+        j = r.json()
+        u = j.get("usage") or {}
+        t = j.get("timings") or {}            # llama.cpp's server adds exact timings
+        usage = {"prompt_tokens": u.get("prompt_tokens"), "completion_tokens": u.get("completion_tokens"),
+                 "prompt_seconds": (t.get("prompt_ms") or 0) / 1000 or None, "completion_seconds": (t.get("predicted_ms") or 0) / 1000 or None}
+        return j["choices"][0]["message"]["content"] or "", {k: v for k, v in usage.items() if v}
 
     def parameter_count_b(self):
         return parse_param_size(self.model)
