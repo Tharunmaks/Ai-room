@@ -194,20 +194,34 @@ def _storage_bytes_read() -> int | None:
     return None
 
 
-def bench(model_path: str, threads: int = 0, gen_tokens: int = 64, n_ctx: int = 2048) -> dict:
+def bench(model_path: str, threads: int = 0, gen_tokens: int = 64, n_ctx: int = 2048, repack: bool = False) -> dict:
     """Load a GGUF with memory-mapping (the weights are paged in from storage as they are used) and time it.
 
-    Major page faults count reads from storage, so they show how much of the model was streamed rather than held in RAM.
+    Repacking is off by default: llama.cpp otherwise copies weights into a faster CPU layout in ordinary memory, which
+    cannot be streamed, so a model bigger than RAM is killed for running out of memory (measured: an 18.6 GB model on a
+    15.7 GB machine died with 13.9 GB of copied weights). Turn it on for models that fit in RAM; it can be faster.
     """
     try:
+        import llama_cpp.llama_cpp as C
         from llama_cpp import Llama
     except ImportError as e:
         raise SystemExit(f"bench needs llama-cpp-python ({e}). Plan works without it.")
     size = os.path.getsize(model_path) / GB
     r0 = resource.getrusage(resource.RUSAGE_SELF)
     io0 = _storage_bytes_read()
+    original = C.llama_model_default_params
+
+    def params():
+        p = original()
+        if hasattr(p, "use_extra_bufts"):
+            p.use_extra_bufts = repack          # the setting behind llama.cpp's --no-repack
+        return p
+    C.llama_model_default_params = params
     t = time.perf_counter()
-    llm = Llama(model_path=model_path, n_ctx=n_ctx, n_threads=threads or os.cpu_count(), use_mmap=True, use_mlock=False, verbose=False)
+    try:
+        llm = Llama(model_path=model_path, n_ctx=n_ctx, n_threads=threads or os.cpu_count(), use_mmap=True, use_mlock=False, verbose=False)
+    finally:
+        C.llama_model_default_params = original
     load = time.perf_counter() - t
     prompt = "Explain, step by step, why the sky looks blue during the day and red at sunset."
     t = time.perf_counter()
@@ -221,7 +235,7 @@ def bench(model_path: str, threads: int = 0, gen_tokens: int = 64, n_ctx: int = 
     n1, n2 = out["usage"]["completion_tokens"], out2["usage"]["completion_tokens"]
     page = resource.getpagesize()
     read = (io1 - io0) if io0 is not None and io1 is not None else (r1.ru_majflt - r0.ru_majflt) * page
-    return {"model": os.path.basename(model_path), "file_gb": round(size, 2), "ram_gb": ram_gb(), "load_seconds": round(load, 1),
+    return {"model": os.path.basename(model_path), "file_gb": round(size, 2), "ram_gb": ram_gb(), "repack": repack, "load_seconds": round(load, 1),
             "first_run_tok_s": round(n1 / gen, 2), "second_run_tok_s": round(n2 / gen2, 2), "tokens": [n1, n2],
             "read_from_storage_gb": round(read / GB, 2),
             "peak_resident_gb": round(r1.ru_maxrss * 1024 / GB, 2), "sample": out2["choices"][0]["text"][:200]}

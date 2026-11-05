@@ -155,6 +155,7 @@ def main(argv: list[str] | None = None) -> None:
     bm.add_argument("--target", type=float, default=0, help="plan: show how far each model is from this speed in tokens/second")
     bm.add_argument("--threads", type=int, default=0)
     bm.add_argument("--tokens", type=int, default=64)
+    bm.add_argument("--repack", action="store_true", help="bench: let llama.cpp repack weights for speed (only for models that fit in RAM)")
 
     sp = sub.add_parser("speed", help="measure how fast a model reads and writes on this machine (tokens/second)")
     sp.add_argument("--student", required=True, help="backend:model, e.g. ollama:qwen2.5:1.5b")
@@ -201,7 +202,7 @@ def main(argv: list[str] | None = None) -> None:
         if a.action == "bench":
             if not a.model:
                 raise SystemExit("bench needs a .gguf file: ai-room bigmodel bench path/to/model.gguf")
-            print(json.dumps(B.bench(a.model, a.threads, a.tokens), indent=1))
+            print(json.dumps(B.bench(a.model, a.threads, a.tokens, repack=a.repack), indent=1))
             return
         print("Measuring this device…")
         dev = B.measure_device(a.storage_dir)
