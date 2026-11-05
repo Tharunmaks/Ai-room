@@ -145,6 +145,17 @@ def main(argv: list[str] | None = None) -> None:
     bo.add_argument("--seed", type=int, default=7)
     bo.add_argument("--out", default="data/boost/report.json")
 
+    bm = sub.add_parser("bigmodel", help="can this device run a big model (dense, MoE, streamed), and how fast can it possibly go?")
+    bm.add_argument("action", choices=["plan", "bench"], help="plan: measure this device and do the arithmetic; bench: time a real .gguf model")
+    bm.add_argument("model", nargs="?", help="bench: path to a .gguf file")
+    bm.add_argument("--models", help="plan: comma-separated shapes, e.g. 27,70,30.5/3.3 (dense 27B, dense 70B, MoE 30.5B with 3.3B active)")
+    bm.add_argument("--bits", type=float, default=4.9, help="average bits per weight (Q4_K_M is about 4.9)")
+    bm.add_argument("--storage-dir", help="plan: a folder on the storage you would keep models on")
+    bm.add_argument("--ram", type=float, help="plan: free RAM in GB instead of measuring it")
+    bm.add_argument("--target", type=float, default=0, help="plan: show how far each model is from this speed in tokens/second")
+    bm.add_argument("--threads", type=int, default=0)
+    bm.add_argument("--tokens", type=int, default=64)
+
     sp = sub.add_parser("speed", help="measure how fast a model reads and writes on this machine (tokens/second)")
     sp.add_argument("--student", required=True, help="backend:model, e.g. ollama:qwen2.5:1.5b")
     sp.add_argument("--base-url")
@@ -184,6 +195,26 @@ def main(argv: list[str] | None = None) -> None:
         except ConnectionError as e:
             raise SystemExit(str(e))
         print("\n" + summary_table(rep))
+        return
+    if a.cmd == "bigmodel":
+        from . import bigmodel as B
+        if a.action == "bench":
+            if not a.model:
+                raise SystemExit("bench needs a .gguf file: ai-room bigmodel bench path/to/model.gguf")
+            print(json.dumps(B.bench(a.model, a.threads, a.tokens), indent=1))
+            return
+        print("Measuring this device…")
+        dev = B.measure_device(a.storage_dir)
+        if a.ram:
+            dev["ram_gb"]["available"] = a.ram
+        st = dev["storage"]
+        print(f"RAM free {dev['ram_gb']['available'] or 0:.1f} GB of {dev['ram_gb']['total'] or 0:.1f} GB · {dev['cores']} cores · "
+              f"memory ~{dev['memory_gbps']} GB/s · storage reads ~{st['gbps']} GB/s" + ("" if st["cache_dropped"] else " (could not bypass the cache; may be too high)"))
+        shapes = [B.parse_shape(x.strip(), a.bits) for x in a.models.split(",") if x.strip()] if a.models else [B.ModelShape(m.name, m.total_b, m.active_b, a.bits) for m in B.DEFAULT_SHAPES]
+        print()
+        print(B.plan_table(B.plan(shapes, dev), a.target or None))
+        print("\nThese are upper limits. Real engines reach most of the in-RAM figure; streaming usually lands well below its figure,")
+        print("and a 1 GB storage test can read faster than a multi-GB model does. Check with: ai-room bigmodel bench model.gguf")
         return
     if a.cmd == "speed":
         from .boost import measure_speed
