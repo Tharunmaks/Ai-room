@@ -177,9 +177,12 @@ def main(argv: list[str] | None = None) -> None:
             check_student_size(llm, a.student_params)
         except ModelTooLargeError as e:
             raise SystemExit(str(e))
-        rep = run(llm, BoostConfig(subjects=[x.strip() for x in a.subjects.split(",") if x.strip()], grades=parse_grades(a.grades), eval_examples=a.eval,
+        try:
+            rep = run(llm, BoostConfig(subjects=[x.strip() for x in a.subjects.split(",") if x.strip()], grades=parse_grades(a.grades), eval_examples=a.eval,
                                    study_examples=a.study, practice=a.practice, pages=a.pages, votes=a.votes, methods=[m.strip() for m in a.methods.split(",") if m.strip()],
                                    parallel=a.parallel, max_tokens=a.max_tokens, seed=a.seed, out=a.out))
+        except ConnectionError as e:
+            raise SystemExit(str(e))
         print("\n" + summary_table(rep))
         return
     if a.cmd == "speed":

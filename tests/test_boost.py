@@ -123,11 +123,24 @@ def test_vote_takes_the_most_common_answer(tmp_path):
     assert rep["results"][-1]["name"] == "plain + vote" and rep["results"][-1]["accuracy"] == 1.0
 
 
-def test_a_failing_model_counts_as_wrong_answers_not_a_crash(tmp_path):
+def test_an_unreachable_model_stops_before_the_exam(tmp_path):
     class Down(Scripted):
         def chat_with_usage(self, *a, **k):
-            raise ConnectionError("server down")
-    rep = run(Down(lambda *a: ""), BoostConfig(eval_examples=4, methods=["plain"], out=str(tmp_path / "d.json")), log=lambda m: None)
+            raise ConnectionError("[Errno 111] Connection refused")
+    with pytest.raises(ConnectionError, match="Connection refused|did not answer"):
+        run(Down(lambda *a: ""), BoostConfig(eval_examples=4, methods=["plain"], out=str(tmp_path / "d.json")), log=lambda m: None)
+    assert not (tmp_path / "d.json").exists()                  # no misleading 0% report is written
+
+
+def test_a_model_that_fails_mid_run_is_counted_not_hidden(tmp_path):
+    class Flaky(Scripted):
+        def chat_with_usage(self, messages, temperature=0.7, max_tokens=2048):
+            if self.calls >= 1:                              # the reachability check passes, then the server drops
+                self.calls += 1
+                raise TimeoutError("read timed out")
+            self.calls += 1
+            return "ok", {}
+    rep = run(Flaky(lambda *a: ""), BoostConfig(eval_examples=4, methods=["plain"], out=str(tmp_path / "d.json")), log=lambda m: None)
     assert rep["results"][0]["accuracy"] == 0.0 and "did not answer" in rep["results"][0]["rows"][0]["reply"]
 
 

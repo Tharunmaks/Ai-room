@@ -208,10 +208,19 @@ class Runner:
 
 
 # ------------------------------------------------------------------ the run
+def check_reachable(llm: LLM) -> None:
+    """Stop before the exam if the model cannot be reached. Otherwise every question would be graded wrong and the report would say 0%."""
+    try:
+        llm.chat_with_usage([Message("user", "Reply with OK.")], temperature=0.0, max_tokens=1)
+    except Exception as e:
+        raise ConnectionError(f"The model did not answer ({e.__class__.__name__}: {e}). Check that its server is running and that --base-url points at it.") from e
+
+
 def run(llm: LLM, cfg: BoostConfig, log: Callable[[str], None] = print) -> dict:
     bad = [m for m in cfg.methods if m not in METHODS]
     if bad:
         raise ValueError(f"unknown methods {bad}; choose from {', '.join(METHODS)}")
+    check_reachable(llm)
     exam = make_problems(cfg.subjects, cfg.grades, cfg.eval_examples, cfg.seed + 1000)
     seen = {q["question"] for q in exam}
     study = make_problems(cfg.subjects, cfg.grades, cfg.study_examples, cfg.seed, avoid=seen)
