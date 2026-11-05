@@ -4,7 +4,7 @@ import re
 
 import pytest
 
-from ai_room.boost import BoostConfig, Notebook, apply_calculator, build_prompt, mistake_page, run, study_page
+from ai_room.boost import BoostConfig, Notebook, apply_calculator, build_messages, build_prompt, mistake_page, run, study_page
 from ai_room.llm import LLM
 from ai_room.train_cpu import make_problems
 
@@ -18,7 +18,7 @@ class Scripted(LLM):
 
     def chat_with_usage(self, messages, temperature=0.7, max_tokens=2048):
         self.calls += 1
-        return self.rule(messages[-1].content, temperature, self.calls), {"prompt_tokens": len(messages[-1].content.split()), "completion_tokens": 5, "completion_seconds": 0.01}
+        return self.rule(messages, temperature, self.calls), {"prompt_tokens": sum(len(m.content.split()) for m in messages), "completion_tokens": 5, "completion_seconds": 0.01}
 
     def chat(self, messages, temperature=0.7, max_tokens=2048):
         return self.chat_with_usage(messages, temperature, max_tokens)[0]
@@ -36,12 +36,16 @@ def test_exam_is_the_same_one_ai_room_train_uses():
 def test_notebook_finds_pages_on_the_same_topic():
     nb = Notebook()
     for q in make_problems(["math"], [1, 2, 3, 4, 5], 200, seed=1):
-        nb.add(study_page(q), q["family"], "study")
+        nb.add(study_page(q), q["family"], "study", q)
     q = next(q for q in make_problems(["math"], [1, 2, 3, 4, 5], 50, seed=99) if q["family"] == "Fractions")
     found = nb.search(q["question"] + " " + q["family"], 3)
     assert len(found) == 3 and sum(p["topic"] == "Fractions" for p in found) >= 2
-    assert "Pages from your notebook" in build_prompt(q, nb, 3, False) and q["question"] in build_prompt(q, nb, 3, False)
-    assert build_prompt(q, None, 3, False).startswith(q["question"].split()[0])
+    msgs = build_messages(q, nb, 3, False)
+    assert [m.role for m in msgs] == ["user", "assistant"] * 3 + ["user"]       # worked examples, then the question
+    assert all("FINAL ANSWER:" in m.content for m in msgs if m.role == "assistant")
+    assert q["question"] in msgs[-1].content and q["question"] not in "".join(m.content for m in msgs[:-1])
+    assert [m.role for m in build_messages(q, None, 3, False)] == ["user"]
+    assert "[assistant]" in build_prompt(q, nb, 3, False)
 
 
 def test_mistake_pages_record_the_wrong_answer_and_the_right_method():
@@ -73,16 +77,20 @@ def test_grader_already_reads_simple_fractions():
     assert grade_question({"type": "numeric", "answer": "60"}, "FINAL ANSWER: 120/2")[0] == 1.0
 
 
+def test_calculator_tip_has_no_example_to_copy():
+    from ai_room.boost import CALC_TIP
+    assert not re.search(r"\d", CALC_TIP)
+
+
 def test_calculator_leaves_multiple_choice_alone():
     assert apply_calculator({"type": "mcq", "answer": "A"}, "FINAL ANSWER: 2+2") == ("FINAL ANSWER: 2+2", False)
 
 
 def keyed_rule(exam_answers):
     """A student that is right only when its notebook is in the prompt, so the test controls exactly what changes the score."""
-    def rule(prompt, temperature, n):
-        q = re.findall(r"Topic: [^\n]*\n(.*?)\n", prompt) or [prompt.split("\n")[0]]
-        key = exam_answers.get(q[-1].strip())
-        if "Pages from your notebook" in prompt and key is not None:
+    def rule(messages, temperature, n):
+        key = exam_answers.get(messages[-1].content.split("\n")[0].strip())
+        if len(messages) > 1 and key is not None:          # worked examples came before the question
             return f"FINAL ANSWER: {key}"
         return "FINAL ANSWER: -424242"
     return rule
@@ -108,8 +116,8 @@ def test_vote_takes_the_most_common_answer(tmp_path):
     exam = make_problems(["math"], [1], 5, 7 + 1000)
     key = {q["question"]: q["answer"] for q in exam}
 
-    def rule(prompt, temperature, n):
-        q = prompt.split("\n")[0]
+    def rule(messages, temperature, n):
+        q = messages[-1].content.split("\n")[0]
         return f"FINAL ANSWER: {key.get(q, 0)}" if n % 3 else "FINAL ANSWER: 1234567"   # wrong one time in three
     rep = run(Scripted(rule), BoostConfig(grades=[1], eval_examples=5, methods=["plain", "vote"], votes=3, out=str(tmp_path / "v.json")), log=lambda m: None)
     assert rep["results"][-1]["name"] == "plain + vote" and rep["results"][-1]["accuracy"] == 1.0

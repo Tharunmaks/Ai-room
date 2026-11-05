@@ -58,9 +58,9 @@ class Notebook:
     def __init__(self):
         self.pages: list[dict] = []
 
-    def add(self, text: str, topic: str, kind: str):
+    def add(self, text: str, topic: str, kind: str, problem: dict | None = None):
         toks = tokenize(text + " " + topic)
-        self.pages.append({"text": text, "topic": topic, "kind": kind, "tf": Counter(toks), "len": len(toks)})
+        self.pages.append({"text": text, "topic": topic, "kind": kind, "problem": problem, "tf": Counter(toks), "len": len(toks)})
 
     def search(self, query: str, k: int) -> list[dict]:
         if not self.pages or k <= 0:
@@ -91,16 +91,31 @@ def mistake_page(q: dict, given: str) -> str:
             + f"\nI answered {given or '(nothing)'}, which was wrong. Correct working: {target_of(q)}")
 
 
-CALC_TIP = "\nTip: you may write the final answer as an arithmetic expression, e.g. FINAL ANSWER: (120 - 45) * 3 — AI Room's calculator works it out exactly."
+CALC_TIP = "\nIf the answer needs arithmetic, you may write the arithmetic itself after FINAL ANSWER (digits, + - * / and brackets); AI Room will compute it exactly."
+MISTAKE_NOTE = "Some of the earlier questions in this conversation are ones you once got wrong; the answers shown are the correct ones."
+
+
+def build_messages(q: dict, notebook: Notebook | None, pages: int, calculator: bool) -> list[Message]:
+    """The exam question, preceded by the notebook pages most like it, shown as worked examples (a past question and its correct answer).
+
+    Chat models copy the format of earlier answers far more reliably than they follow pasted notes, so this keeps
+    their replies short and ending in 'FINAL ANSWER: …'.
+    """
+    tip = CALC_TIP if calculator else ""
+    found = notebook.search(q["question"] + " " + q.get("family", ""), pages) if notebook else []
+    msgs: list[Message] = []
+    if any(p["kind"] == "mistake" for p in found):
+        msgs.append(Message("system", MISTAKE_NOTE))
+    for p in reversed(found):                      # the most similar page sits right before the question
+        ex = p["problem"]
+        msgs += [Message("user", prompt_of(ex) + (tip if ex["type"] == "numeric" else "")), Message("assistant", target_of(ex))]
+    msgs.append(Message("user", prompt_of(q) + (tip if q["type"] == "numeric" else "")))
+    return msgs
 
 
 def build_prompt(q: dict, notebook: Notebook | None, pages: int, calculator: bool) -> str:
-    base = prompt_of(q) + (CALC_TIP if calculator and q["type"] == "numeric" else "")
-    found = notebook.search(q["question"] + " " + q.get("family", ""), pages) if notebook else []
-    if not found:
-        return f"Topic: {q.get('family', '')}\n{base}" if notebook else base
-    notes = "\n\n".join(f"Page {i} ({p['topic']}{', a mistake you made' if p['kind'] == 'mistake' else ''})\n{p['text']}" for i, p in enumerate(found, 1))
-    return f"Pages from your notebook (worked examples you studied):\n\n{notes}\n\nUse the same method. Topic: {q.get('family', '')}\n{base}"
+    """The same conversation as plain text (for reports and debugging)."""
+    return "\n\n".join(f"[{m.role}] {m.content}" for m in build_messages(q, notebook, pages, calculator))
 
 
 # ------------------------------------------------------------------ answering
@@ -134,20 +149,20 @@ class Runner:
     def __init__(self, llm: LLM, cfg: BoostConfig, log: Callable[[str], None]):
         self.llm, self.cfg, self.log = llm, cfg, log
 
-    def ask(self, prompt: str, temperature: float) -> tuple[str, dict]:
+    def ask(self, messages: list[Message], temperature: float) -> tuple[str, dict]:
         t = time.perf_counter()
         try:
-            text, usage = self.llm.chat_with_usage([Message("user", prompt)], temperature=temperature, max_tokens=self.cfg.max_tokens)
+            text, usage = self.llm.chat_with_usage(messages, temperature=temperature, max_tokens=self.cfg.max_tokens)
         except Exception as e:  # a dropped request counts as a wrong answer; the run goes on
             text, usage = f"(the model did not answer: {e.__class__.__name__})", {}
         usage["wall_seconds"] = time.perf_counter() - t
         return text, usage
 
     def answer(self, q: dict, notebook: Notebook | None, calculator: bool, votes: int) -> dict:
-        prompt = build_prompt(q, notebook, self.cfg.pages, calculator)
+        messages = build_messages(q, notebook, self.cfg.pages, calculator)
         replies, usages = [], []
         for i in range(max(1, votes)):
-            text, u = self.ask(prompt, 0.0 if votes <= 1 else 0.7)
+            text, u = self.ask(messages, 0.0 if votes <= 1 else 0.7)
             if calculator:
                 text, _ = apply_calculator(q, text)
             replies.append(text)
@@ -210,14 +225,14 @@ def run(llm: LLM, cfg: BoostConfig, log: Callable[[str], None] = print) -> dict:
     for m in [x for x in METHODS if x in cfg.methods]:
         if m == "notes":
             for q in study:
-                notebook.add(study_page(q), q.get("family", ""), "study")
+                notebook.add(study_page(q), q.get("family", ""), "study", q)
             log(f"Studied {len(study)} worked examples → {len(notebook.pages)} notebook pages")
         elif m == "mistakes":
             log(f"Practice test ({len(practice)} questions, not part of the exam)…")
             pr = Runner(llm, cfg, log).sit("practice", practice, notebook if notebook.pages else None, calculator)
             wrong = [(q, r) for q, r in zip(practice, pr["rows"]) if not r["correct"]]
             for q, r in wrong:
-                notebook.add(mistake_page(q, r["given"]), q.get("family", ""), "mistake")
+                notebook.add(mistake_page(q, r["given"]), q.get("family", ""), "mistake", q)
             report["practice"] = {"accuracy": pr["accuracy"], "mistakes_written": len(wrong)}
             log(f"  practice: {pr['accuracy']:.0%} right · wrote {len(wrong)} mistake pages")
         elif m == "calculator":
@@ -230,7 +245,7 @@ def run(llm: LLM, cfg: BoostConfig, log: Callable[[str], None] = print) -> dict:
         res = Runner(llm, cfg, log).sit(label, exam, notebook if notebook.pages else None, calculator, votes)
         report["results"].append(res)
         sp = res["speed"]
-        log(f"  {label}: {res['accuracy']:.1%} · {res['seconds']:.0f}s · generation {sp['generation_tokens_per_second'] or '?'} tok/s · all tokens {sp['total_tokens_per_second_wall'] or '?'} tok/s")
+        log(f"  {label}: {res['accuracy']:.1%} · {res['seconds']:.0f}s · generation {sp['generation_tokens_per_second'] or 'n/a'} tok/s · all tokens {sp['total_tokens_per_second_wall'] or 'n/a'} tok/s")
     report["seconds_total"] = round(time.time() - report.pop("started"), 1)
     out = Path(cfg.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -240,8 +255,11 @@ def run(llm: LLM, cfg: BoostConfig, log: Callable[[str], None] = print) -> dict:
 
 
 def summary_table(report: dict) -> str:
+    """Accuracy and measured speed per method. 'gen tok/s' is the engine's own generation speed (n/a when the server does not
+    report timings); 'all tok/s' is prompt + generated tokens divided by wall-clock time."""
+    num = lambda v: f"{v:.1f}" if v else "n/a"  # noqa: E731
     lines = [f"{'method':<44}{'accuracy':>9}{'gen tok/s':>11}{'all tok/s':>11}{'seconds':>9}"]
     for r in report["results"]:
         sp = r["speed"]
-        lines.append(f"{r['name']:<44}{r['accuracy']:>8.1%}{(sp['generation_tokens_per_second'] or 0):>11.1f}{(sp['total_tokens_per_second_wall'] or 0):>11.1f}{r['seconds']:>9.0f}")
+        lines.append(f"{r['name']:<44}{r['accuracy']:>8.1%}{num(sp['generation_tokens_per_second']):>11}{num(sp['total_tokens_per_second_wall']):>11}{r['seconds']:>9.0f}")
     return "\n".join(lines)
