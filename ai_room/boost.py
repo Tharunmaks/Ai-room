@@ -263,3 +263,34 @@ def summary_table(report: dict) -> str:
         sp = r["speed"]
         lines.append(f"{r['name']:<44}{r['accuracy']:>8.1%}{num(sp['generation_tokens_per_second']):>11}{num(sp['total_tokens_per_second_wall']):>11}{r['seconds']:>9.0f}")
     return "\n".join(lines)
+
+
+# ------------------------------------------------------------------ speed check
+SPEED_PROMPT = "Here is a passage to read carefully. " + "The history of mathematics is long and full of surprising ideas. " * 40
+
+
+def measure_speed(llm: LLM, gen_tokens: int = 128) -> dict:
+    """Measure how fast this model reads a prompt and generates text on this machine.
+
+    Prefers the engine's own timings (Ollama and llama.cpp's server report them); otherwise times two requests: a long prompt
+    with a 1-token reply (reading speed) and a short prompt with a long reply (generation speed).
+    """
+    t = time.perf_counter()
+    _, u1 = llm.chat_with_usage([Message("user", SPEED_PROMPT + "\nReply with one word.")], temperature=0.0, max_tokens=1)
+    w1 = time.perf_counter() - t
+    t = time.perf_counter()
+    _, u2 = llm.chat_with_usage([Message("user", "Count slowly from one to two hundred in words, separated by commas.")], temperature=0.0, max_tokens=gen_tokens)
+    w2 = time.perf_counter() - t
+    out = {"model": llm.name, "source": "engine timings" if u2.get("completion_seconds") else "wall-clock timing"}
+    if u1.get("prompt_tokens"):
+        secs = u1.get("prompt_seconds") or w1
+        out["prompt_tokens_per_second"] = round(u1["prompt_tokens"] / secs, 1)
+    if u2.get("completion_tokens"):
+        secs = u2.get("completion_seconds") or max(1e-6, w2 - (u2.get("prompt_tokens", 0) / out["prompt_tokens_per_second"] if out.get("prompt_tokens_per_second") else 0))
+        out["generation_tokens_per_second"] = round(u2["completion_tokens"] / secs, 1)
+    size = llm.parameter_count_b()
+    if size and out.get("generation_tokens_per_second"):
+        # Generating is limited by reading every weight once per token, so speed scales roughly with 1 / model size (same quantisation).
+        out["estimated_generation_tokens_per_second"] = {f"{b:g}B": round(out["generation_tokens_per_second"] * size / b, 2) for b in (1.5, 3, 7, 14, 27, 70)}
+        out["needed_for_1200_tokens_per_second"] = f"{1200 / out['generation_tokens_per_second']:.0f}× this machine's memory bandwidth for a {size:g}B model"
+    return out

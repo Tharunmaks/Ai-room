@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import threading
@@ -144,6 +145,11 @@ def main(argv: list[str] | None = None) -> None:
     bo.add_argument("--seed", type=int, default=7)
     bo.add_argument("--out", default="data/boost/report.json")
 
+    sp = sub.add_parser("speed", help="measure how fast a model reads and writes on this machine (tokens/second)")
+    sp.add_argument("--student", required=True, help="backend:model, e.g. ollama:qwen2.5:1.5b")
+    sp.add_argument("--base-url")
+    sp.add_argument("--student-params", type=float)
+
     q = sub.add_parser("ask", help="ask a model saved by `ai-room train` a question")
     q.add_argument("model_dir", help="e.g. data/trained/model/merged")
     q.add_argument("question")
@@ -175,6 +181,15 @@ def main(argv: list[str] | None = None) -> None:
                                    study_examples=a.study, practice=a.practice, pages=a.pages, votes=a.votes, methods=[m.strip() for m in a.methods.split(",") if m.strip()],
                                    parallel=a.parallel, max_tokens=a.max_tokens, seed=a.seed, out=a.out))
         print("\n" + summary_table(rep))
+        return
+    if a.cmd == "speed":
+        from .boost import measure_speed
+        from .llm import make_llm
+        spec = _student(a.student)
+        if spec["backend"] == "demo":
+            raise SystemExit("speed needs a real model (ollama:… or openai:…)")
+        res = measure_speed(make_llm(spec["backend"], spec["model"], a.base_url))
+        print(json.dumps(res, indent=1))
         return
     if a.cmd == "ask":
         from .train_cpu import ask

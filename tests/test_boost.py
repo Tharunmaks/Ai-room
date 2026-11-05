@@ -134,3 +134,17 @@ def test_a_failing_model_counts_as_wrong_answers_not_a_crash(tmp_path):
 def test_unknown_methods_are_refused(tmp_path):
     with pytest.raises(ValueError):
         run(Scripted(lambda *a: ""), BoostConfig(methods=["telepathy"], out=str(tmp_path / "x.json")), log=lambda m: None)
+
+
+def test_speed_check_reports_measured_speeds_and_size_estimates():
+    from ai_room.boost import measure_speed
+
+    class Timed(Scripted):
+        def chat_with_usage(self, messages, temperature=0.7, max_tokens=2048):
+            if max_tokens == 1:
+                return "ok", {"prompt_tokens": 500, "prompt_seconds": 2.0}
+            return "one, two", {"prompt_tokens": 20, "completion_tokens": 128, "prompt_seconds": 0.1, "completion_seconds": 8.0}
+    r = measure_speed(Timed(lambda *a: ""))
+    assert r["prompt_tokens_per_second"] == 250.0 and r["generation_tokens_per_second"] == 16.0
+    assert r["estimated_generation_tokens_per_second"]["27B"] == round(16.0 * 1.5 / 27, 2)
+    assert r["source"] == "engine timings"
