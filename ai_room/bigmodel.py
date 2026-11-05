@@ -94,8 +94,27 @@ def storage_read_gbps(folder: str | None = None, mb: int = 1024, chunk_mb: int =
             pass
 
 
+def compute_gflops(n: int = 1024, rounds: int = 3) -> float | None:
+    """Speed of a float32 matrix multiply: the most arithmetic this CPU can do per second. None if numpy is not installed."""
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    a = np.random.rand(n, n).astype(np.float32)
+    b = np.random.rand(n, n).astype(np.float32)
+    a @ b                                    # warm up the BLAS library
+    best = 0.0
+    for _ in range(rounds):
+        t = time.perf_counter()
+        a @ b
+        dt = time.perf_counter() - t
+        best = max(best, 2 * n ** 3 / dt / 1e9)
+    return round(best, 1)
+
+
 def measure_device(storage_folder: str | None = None) -> dict:
-    return {"ram_gb": ram_gb(), "cores": os.cpu_count(), "memory_gbps": memory_bandwidth_gbps(), "storage": storage_read_gbps(storage_folder)}
+    return {"ram_gb": ram_gb(), "cores": os.cpu_count(), "memory_gbps": memory_bandwidth_gbps(), "storage": storage_read_gbps(storage_folder),
+            "gflops": compute_gflops()}
 
 
 # ------------------------------------------------------------------ the arithmetic
@@ -134,10 +153,16 @@ def parse_shape(spec: str, bits: float = Q4_BITS) -> ModelShape:
     return ModelShape(f"MoE {t:g}B ({a:g}B active)" if a else f"dense {t:g}B", t, a, bits)
 
 
-def plan_one(m: ModelShape, ram_free_gb: float, memory_gbps: float, storage_gbps: float, reserve_gb: float = 1.0) -> dict:
-    """Fits in RAM? And the fastest it could go, from RAM or streamed from storage."""
+def plan_one(m: ModelShape, ram_free_gb: float, memory_gbps: float, storage_gbps: float, reserve_gb: float = 1.0, gflops: float | None = None) -> dict:
+    """Fits in RAM? And the fastest it could go, from RAM or streamed from storage.
+
+    Two limits apply. One user's text is limited by memory (every token reads the weights it uses). Many users at once can share
+    each read, but the arithmetic then limits the total: 2 operations per active parameter per token, so gflops / (2 × active).
+    """
     usable = max(0.0, ram_free_gb - reserve_gb)          # room for the OS, the context cache and the app itself
     row = {"model": m.name, "file_gb": round(m.file_gb, 1), "token_gb": round(m.token_gb, 2), "fits_in_ram": m.file_gb <= usable}
+    if gflops:
+        row["max_tok_s_many_users"] = round(gflops / (2 * (m.active_b if m.moe else m.total_b)), 2)
     if row["fits_in_ram"]:
         row["max_tok_s"] = round(memory_gbps / m.token_gb, 2)
         row["how"] = "all in RAM"
@@ -166,19 +191,22 @@ def plan_one(m: ModelShape, ram_free_gb: float, memory_gbps: float, storage_gbps
 
 def plan(shapes: list[ModelShape], device: dict) -> list[dict]:
     free = device["ram_gb"]["available"] or device["ram_gb"]["total"] or 0.0
-    return [plan_one(m, free, device["memory_gbps"], device["storage"]["gbps"]) for m in shapes]
+    return [plan_one(m, free, device["memory_gbps"], device["storage"]["gbps"], gflops=device.get("gflops")) for m in shapes]
 
 
 def plan_table(rows: list[dict], target: float | None = None) -> str:
-    lines = [f"{'model':<26}{'file GB':>8}{'GB/token':>9}  {'fits':<5}{'max tok/s':>10}  how"]
+    lines = [f"{'model':<26}{'file GB':>8}{'GB/token':>9}  {'fits':<5}{'1 user':>8}{'many users':>12}  how"]
     for r in rows:
         tok = r.get("max_tok_s")
+        many = r.get("max_tok_s_many_users")
         extra = ""
         if not r["fits_in_ram"] and r.get("max_tok_s_nothing_cached") is not None:
             extra = f" (nothing cached: {r['max_tok_s_nothing_cached']:g}, cache holds {r['cached_share']:.0%})"
-        lines.append(f"{r['model']:<26}{r['file_gb']:>8.1f}{r['token_gb']:>9.2f}  {'yes' if r['fits_in_ram'] else 'no':<5}{(f'{tok:g}' if tok is not None else 'n/a'):>10}  {r['how']}{extra}")
-        if target and tok:
-            lines[-1] += f"  [{target / tok:.0f}× short of {target:g} tok/s]" if tok < target else f"  [reaches {target:g} tok/s]"
+        lines.append(f"{r['model']:<26}{r['file_gb']:>8.1f}{r['token_gb']:>9.2f}  {'yes' if r['fits_in_ram'] else 'no':<5}"
+                     f"{(f'{tok:g}' if tok is not None else 'n/a'):>8}{(f'{many:g}' if many is not None else 'n/a'):>12}  {r['how']}{extra}")
+        if target:
+            best = max(v for v in (tok, many) if v is not None) if (tok is not None or many is not None) else 0
+            lines[-1] += (f"  [{target / best:.0f}× short of {target:g}]" if best < target else f"  [reaches {target:g}]")
     return "\n".join(lines)
 
 

@@ -210,7 +210,9 @@ def main(argv: list[str] | None = None) -> None:
             dev["ram_gb"]["available"] = a.ram
         st = dev["storage"]
         print(f"RAM free {dev['ram_gb']['available'] or 0:.1f} GB of {dev['ram_gb']['total'] or 0:.1f} GB · {dev['cores']} cores · "
-              f"memory ~{dev['memory_gbps']} GB/s · storage reads ~{st['gbps']} GB/s" + ("" if st["cache_dropped"] else " (could not bypass the cache; may be too high)"))
+              f"memory ~{dev['memory_gbps']} GB/s · storage reads ~{st['gbps']} GB/s · arithmetic "
+              + (f"~{dev['gflops']} GFLOP/s" if dev.get("gflops") else "not measured (pip install numpy)")
+              + ("" if st["cache_dropped"] else " (could not bypass the cache; may be too high)"))
         shapes = [B.parse_shape(x.strip(), a.bits) for x in a.models.split(",") if x.strip()] if a.models else [B.ModelShape(m.name, m.total_b, m.active_b, a.bits) for m in B.DEFAULT_SHAPES]
         print()
         print(B.plan_table(B.plan(shapes, dev), a.target or None))

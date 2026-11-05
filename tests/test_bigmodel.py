@@ -49,9 +49,30 @@ def test_plan_command_prints_a_table(capsys, monkeypatch):
     monkeypatch.setattr(B, "measure_device", lambda folder=None: {"ram_gb": {"total": 8, "available": 6}, "cores": 8, "memory_gbps": 20.0, "storage": {"gbps": 1.0, "cache_dropped": True, "folder": "/tmp"}})
     main(["bigmodel", "plan", "--models", "27,30.5/3.3", "--target", "1200"])
     out = capsys.readouterr().out
-    assert "dense 27B" in out and "MoE 30.5B (3.3B active)" in out and "short of 1200 tok/s" in out
+    assert "dense 27B" in out and "MoE 30.5B (3.3B active)" in out and "short of 1200]" in out
 
 
 def test_bench_needs_a_file():
     with pytest.raises(SystemExit):
         main(["bigmodel", "bench"])
+
+
+def test_many_users_are_limited_by_arithmetic_not_memory():
+    m = B.plan_one(B.ModelShape("dense 27B", 27), ram_free_gb=64, memory_gbps=20, storage_gbps=1, gflops=480)
+    assert m["max_tok_s_many_users"] == pytest.approx(480 / 54, rel=1e-3)          # 2 operations per parameter per token
+    moe = B.plan_one(B.ModelShape("moe", 30.5, 3.3), ram_free_gb=64, memory_gbps=20, storage_gbps=1, gflops=480)
+    assert moe["max_tok_s_many_users"] == pytest.approx(480 / (2 * 3.3), rel=1e-3)
+    assert "max_tok_s_many_users" not in B.plan_one(B.ModelShape("d", 1), 64, 20, 1)   # no arithmetic measurement, no such limit
+
+
+def test_no_numpy_means_no_arithmetic_figure(monkeypatch):
+    import builtins
+    real = builtins.__import__
+    monkeypatch.setattr(builtins, "__import__", lambda name, *a, **k: (_ for _ in ()).throw(ImportError()) if name == "numpy" else real(name, *a, **k))
+    assert B.compute_gflops() is None
+
+
+def test_table_names_the_limit_that_applies(capsys):
+    rows = [B.plan_one(B.ModelShape("dense 1.5B", 1.5), 64, 20, 1, gflops=480)]
+    out = B.plan_table(rows, target=1200)
+    assert "many users" in out and "1200" in out
