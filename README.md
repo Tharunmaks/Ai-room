@@ -132,6 +132,46 @@ What to expect:
 * `--dtype bf16` exists, but on the test CPU it was no faster than fp32 (4.08 vs 4.06 s/step), so fp32 is the default.
 * The output is a Hugging Face model folder (`merged/`) plus a small LoRA adapter. To use it in Ollama, convert it to GGUF with llama.cpp's `convert_hf_to_gguf.py`. That conversion step was not tested here.
 
+## 🐘 Big models on a CPU (`ai-room bigmodel`)
+
+Generating a token means reading every weight that token uses, once. So the speed limit is simply
+**tokens/second ≤ bytes per second the device can deliver ÷ bytes per token**. llama.cpp already works at that limit: on the test
+machine, Qwen2.5-1.5B (1.12 GB) generated 18.0 tokens/s, which is 20 GB/s against a measured memory bandwidth of 20.8 GB/s. No
+engine can be 10× faster for the same model on the same CPU; there is nothing left to speed up.
+
+What does make big models usable on a CPU:
+
+* **Mixture-of-experts (MoE) models** read only the experts each token uses. Qwen3-30B-A3B has 30.5B parameters but uses about 3.3B
+  per token, so it runs roughly as fast as a 3B dense model. That is the real "several times faster": it comes from the model, not
+  the engine.
+* **Expert streaming.** When the model is bigger than RAM, its file is memory-mapped: the shared weights stay in RAM and the experts
+  each token needs are read from storage, unless they are still cached. It lets the model run at all. It does not make it fast.
+
+Measured on the test machine (4-core Xeon, 15.7 GB RAM, no GPU, llama.cpp through llama-cpp-python):
+
+| model | parameters | file | fits in RAM? | generation speed |
+|---|---:|---:|---|---|
+| Qwen2.5-1.5B (dense) | 1.5B | 1.1 GB | yes | 18.0 tokens/s |
+| Qwen2.5-3B (dense) | 3.1B | 2.1 GB | yes | 9.8 tokens/s |
+| Qwen3-30B-A3B (MoE, 3.3B active) | 30.5B | 18.6 GB | **no** | **1.2 tokens/s cold, 6.3 tokens/s warm** |
+
+For the 30B run, 27.1 GB was read from disk (more than the file, because pages that did not fit were read again) and at most
+14.3 GB was resident. By the same arithmetic, a dense 27B could manage at most about 0.9 tokens/s on this machine and a dense 70B
+about 0.1. 1,200 tokens/s is out of reach on any CPU for models of that size.
+
+```bash
+ai-room bigmodel plan --target 1200                     # measures this device; runs on a phone (plain Python)
+ai-room bigmodel plan --models 27,70,30.5/3.3           # dense 27B, dense 70B, MoE 30.5B with 3.3B active
+ai-room bigmodel bench path/to/model.gguf              # times a real model and reports how much it read from storage
+```
+
+* `plan` gives ceilings. Real engines reach most of the in-RAM figure; streaming usually lands below its figure (the cold 30B run
+  reached about half), and a 1 GB storage test can read faster than a multi-GB model does.
+* `bench` turns off llama.cpp's weight **repacking**. Repacking copies weights into ordinary memory for faster CPU kernels, which
+  cannot be streamed: with it on, the 18.6 GB model was killed for running out of memory. Use `--repack` only for models that fit.
+* Phones stream from flash storage, which is usually slower than a computer's SSD, and need a llama.cpp build that runs there.
+* The classroom's 27B limit counts *total* parameters, so a 30B MoE model is still refused as a student.
+
 ## The 27B limit
 
 Larger students are refused. The size comes from Ollama (`/api/show`) or from the model name (`qwen2.5:14b`, `gemma3:27b`); Mixture-of-Experts models count their *total* parameters (`8x7b` = 56B), and a model whose size can't be determined is refused unless you declare it. Models reported as slightly over 27B (e.g. Gemma 3 27B reports 27.4B) are accepted.
@@ -178,6 +218,8 @@ ai_room/
     t_math.py t_text.py t_files.py t_svg.py t_image.py t_video.py t_mesh.py t_blender.py t_web.py t_ml.py   the tool families
     recipes.py         automation pipelines          agent.py   the Workshop loop and the rule-based demo planner
   train_cpu.py         real LoRA fine-tuning on a CPU with a before/after exam (`ai-room train`, `ai-room ask`)
+  boost.py             better answers without training, measured (`ai-room boost`, `ai-room speed`)
+  bigmodel.py          what fits on this device and how fast it can go; real benchmarks (`ai-room bigmodel`)
 tests/                 ~190 offline tests
 ```
 
