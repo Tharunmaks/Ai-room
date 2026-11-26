@@ -22,13 +22,15 @@ from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 from . import samples
-from .automl import SECONDS_PER_MB, SPEED_LABELS, SPEEDS, Trained, budget_for, new_id, train_table
-from .data import DataError, Table, ext_of, pick_target, pick_task, profile, read_table, read_text
+from .automl import RATE_LABEL, SECONDS_PER_MB, SPEED_LABELS, SPEEDS, Trained, budget_for, new_id, train_table
+from .data import IMAGE_EXT, DataError, Table, ext_of, pick_target, pick_task, profile, read_table, read_text
+from .images import contact_sheet, describe_zip, image_table, load_image_zip
 from .ingest import DOC_EXT, head_text, human, inspect_table, load_table, load_text, max_cells, sniff_path
 from .textgen import MAX_CHARS, TextModel, train_text
 
 MAX_BYTES = int(float(os.environ.get("AI_ROOM_LAB_MAX_MB", "5000000")) * 1_000_000)   # 5 TB per upload (1 MB = 10^6 bytes)
 SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+MODEL_FILES = ("model.json", "weights.npz", "card.json", "passages.json")
 
 
 class TrainBody(BaseModel):
@@ -36,8 +38,12 @@ class TrainBody(BaseModel):
     target: str | None = None
     task: str = "auto"                 # auto | classification | regression
     ignore: list[str] = []
-    speed: str = "fast"                # fast = 1 s per MB | balanced | thorough
+    speed: str = "fast"                # fast = 10 min per GB | balanced | thorough
     name: str | None = None
+
+
+class RenameBody(BaseModel):
+    name: str
 
 
 class PredictBody(BaseModel):
@@ -86,6 +92,9 @@ def mount(app: FastAPI, data_dir: str | None) -> dict:
     def analyse(folder: Path, filename: str, size: int, sample: str | None = None) -> dict:
         """Describe a stored upload by reading only as much of it as needed."""
         path = folder / ("data" + (ext_of(filename) or ".bin"))
+        if ext_of(filename) in IMAGE_EXT:
+            raise DataError("To teach it pictures, upload a .zip with one folder per category — for example cats/ and dogs/ — "
+                            "with the pictures inside. (To ask a trained picture model about one picture, open the model and use “Try it”.)")
         kind = sniff_path(path, filename)
         info = {"name": re.sub(r"\.[A-Za-z0-9]+$", "", filename) or filename, "filename": filename, "kind": kind, "bytes": size,
                 "created": time.time(), "sample": sample, "file": path.name, "id": folder.name}
@@ -104,8 +113,12 @@ def mount(app: FastAPI, data_dir: str | None) -> dict:
             else:
                 head, _ = head_text(path, 1 << 20)
                 info |= {"documents": 1, "titles": [info["name"]], "chars": size, "chars_exact": False, "preview_text": head[:1500]}
+        elif kind == "images":
+            info |= describe_zip(path)
+            info["target"], info["task"] = "category", "classification"
         else:
-            raise DataError("Folders of images are not supported yet. Upload a table (CSV, TSV, JSON) or text (txt, md, html, pdf, docx, epub).")
+            raise DataError("That kind of file cannot be learned yet. Upload a table (CSV, Excel, TSV, JSON), text (txt, md, html, pdf, docx, epub) "
+                            "or a .zip of pictures with one folder per category.")
         info["budget_seconds"] = round(budget_for("fast", size), 2)
         (folder / "info.json").write_text(json.dumps(info))
         return info
@@ -128,13 +141,14 @@ def mount(app: FastAPI, data_dir: str | None) -> dict:
 
     def brief(info: dict) -> dict:
         return {k: info.get(k) for k in ("id", "name", "filename", "kind", "bytes", "rows", "rows_exact", "columns", "target", "task", "documents", "chars",
-                                         "chars_exact", "created", "sample", "budget_seconds")}
+                                         "chars_exact", "created", "sample", "budget_seconds", "images", "classes")}
 
     @app.get("/api/lab/info")
     def lab_info():
         import numpy
         free = shutil.disk_usage(ds_dir).free
         return {"speeds": [{"key": k, "label": SPEED_LABELS[k], "seconds": s} for k, s in SPEEDS.items()], "seconds_per_mb": SECONDS_PER_MB,
+                "rate_label": RATE_LABEL,
                 "max_bytes": MAX_BYTES, "max_label": human(MAX_BYTES), "disk_free": free, "disk_free_label": human(free),
                 "cpus": os.cpu_count(), "numpy": numpy.__version__, "memory_cells": max_cells(),
                 "samples": [{"key": k, **v} for k, v in samples.SAMPLES.items()], "busy": sum(j["status"] in ("queued", "running") for j in jobs.values())}
@@ -183,6 +197,16 @@ def mount(app: FastAPI, data_dir: str | None) -> dict:
     def get_dataset(did: str):
         return dataset_info(did)
 
+    @app.get("/api/lab/datasets/{did}/preview.png")
+    def dataset_preview(did: str):
+        info = dataset_info(did)
+        if info["kind"] != "images":
+            raise HTTPException(404, "only picture datasets have a preview sheet")
+        out = ds_dir / did / "preview.png"
+        if not out.exists():
+            out.write_bytes(contact_sheet(path_of(info)))
+        return FileResponse(out, media_type="image/png")
+
     @app.delete("/api/lab/datasets/{did}")
     def delete_dataset(did: str):
         dataset_info(did)
@@ -210,10 +234,14 @@ def mount(app: FastAPI, data_dir: str | None) -> dict:
             deadline = t0 + budget
             mid = new_id()
             folder = model_dir / mid
-            say(f"Time allowed: {budget:.1f} s ({SECONDS_PER_MB:g} s per MB of the {human(info['bytes'])} file" + (", at least 1 s" if budget <= 1.0 else "") + ").")
+            say(f"Time allowed: {budget:.1f} s ({RATE_LABEL} of data, for this {human(info['bytes'])} file" + ("; at least 1 s" if budget <= 1.0 else "") + ").")
             if info["kind"] == "text":
                 docs, tinfo = load_text(path, info["filename"], MAX_CHARS, say=say)
                 model = train_text(docs, progress=progress, stop=stop, deadline=deadline - 0.12 * budget)
+            elif info["kind"] == "images":
+                table = load_image_zip(path, deadline=t0 + 0.45 * budget, say=say)
+                model = train_table(table, None, "category", task="classification", progress=progress, stop=stop,
+                                    deadline=deadline - 0.03 * budget, image=True)
             else:
                 table = load_table(path, info["filename"], say=say)
                 model = train_table(table, None, job["target"], task=job["task"], ignore=job["ignore"], progress=progress, stop=stop,
@@ -316,6 +344,63 @@ def mount(app: FastAPI, data_dir: str | None) -> dict:
         meta = read_json(model_dir / mid / "model.json", {})
         return card | {"report": meta.get("report", {})}
 
+    @app.patch("/api/lab/models/{mid}")
+    def rename_model(mid: str, body: RenameBody):
+        card = card_of(mid)
+        name = " ".join(body.name.split())[:80]
+        if not name:
+            raise HTTPException(400, "The name cannot be empty.")
+        card["name"] = name
+        (model_dir / mid / "card.json").write_text(json.dumps(card))
+        return card
+
+    @app.get("/api/lab/models/{mid}/download")
+    def download_model(mid: str):
+        """The model as a .zip (JSON + NumPy arrays, no code): keep it, or open it in another AI Room with Import."""
+        card = card_of(mid)
+        folder = model_dir / mid
+        out = folder.parent / f".{mid}.zip"
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+            for name in MODEL_FILES:
+                if (folder / name).exists():
+                    z.write(folder / name, name)
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", card["name"])[:60] or "model"
+        return FileResponse(out, media_type="application/zip", filename=f"{safe}.ai-room-model.zip", background=BackgroundTask(out.unlink, True))
+
+    @app.post("/api/lab/models/import")
+    async def import_model(request: Request):
+        """Add a model downloaded from (any) AI Room. Only the known model files are read; nothing in it is run."""
+        raw = await request.body()
+        if len(raw) > 8 << 30:
+            raise HTTPException(413, "Model files up to 8 GB, please.")
+        import io as _io
+        mid = None
+        try:
+            z = zipfile.ZipFile(_io.BytesIO(raw))
+            names = set(z.namelist())
+            if not {"model.json", "weights.npz"} <= names:
+                raise HTTPException(400, "That zip is not an AI Room model (it needs model.json and weights.npz).")
+            mid = new_id()
+            folder = model_dir / mid
+            folder.mkdir(parents=True)
+            for name in MODEL_FILES:
+                if name in names:
+                    (folder / name).write_bytes(z.read(name))
+            model = (TextModel if json.loads((folder / "model.json").read_text()).get("type") == "text" else Trained).load(folder)
+            old = read_json(folder / "card.json", {}) or {}
+            card = write_card(folder, model, name=old.get("name") or "Imported model", dataset_name=old.get("dataset_name", "imported"),
+                              seconds=old.get("seconds", 0.0), speed=old.get("speed", ""), budget=old.get("budget"), size=old.get("bytes"))
+            if old.get("curve"):
+                card["curve"] = old["curve"]
+                (folder / "card.json").write_text(json.dumps(card))
+            return card
+        except HTTPException:
+            raise
+        except Exception as e:  # a broken or foreign zip: say so plainly, and leave nothing half-imported
+            if mid:
+                shutil.rmtree(model_dir / mid, ignore_errors=True)
+            raise HTTPException(400, f"Could not import that model: {e}")
+
     @app.delete("/api/lab/models/{mid}")
     def delete_model(mid: str):
         card_of(mid)
@@ -344,12 +429,30 @@ def mount(app: FastAPI, data_dir: str | None) -> dict:
         preds = m.predict(body.rows)
         return {"predictions": preds, "seconds": round(time.perf_counter() - t, 4)}
 
+    @app.post("/api/lab/models/{mid}/predict_image")
+    async def predict_image(mid: str, request: Request):
+        """The picture is the request body; the reply is the category with the model's confidence in each."""
+        m = load(mid)
+        if isinstance(m, TextModel) or not m.report.get("image"):
+            raise HTTPException(400, "This model was not trained on pictures.")
+        raw = await request.body()
+        if len(raw) > 64 << 20:
+            raise HTTPException(413, "Pictures up to 64 MB, please.")
+        try:
+            t = time.perf_counter()
+            pred = m.predict(image_table([raw]))[0]
+        except DataError as e:
+            raise HTTPException(400, str(e))
+        return {"prediction": pred, "seconds": round(time.perf_counter() - t, 4)}
+
     @app.post("/api/lab/models/{mid}/predict_file")
     async def predict_file(mid: str, request: Request, filename: str = "rows.csv"):
         """Send a table (streamed to disk, any size up to the upload limit); get it back as CSV with a prediction on every row."""
         m = load(mid)
         if isinstance(m, TextModel):
             raise HTTPException(400, "Text models write text; upload a table to a table model.")
+        if m.report.get("image") and ext_of(filename) != ".zip":
+            raise HTTPException(400, "For a picture model, upload a .zip of pictures; you get back a CSV with a category for each.")
         import tempfile
         tmp = Path(tempfile.mkdtemp(prefix="lab_predict_", dir=base))
         src = tmp / ("in" + (ext_of(filename) or ".csv"))
@@ -382,6 +485,9 @@ def write_card(folder: Path, model, name: str, dataset: str | None = None, datas
     if isinstance(model, TextModel):
         card = {"type": "text", "summary": f"{report['chars']:,} characters, context {report['order']}",
                 "score": {"bits_per_char": report["valid_bits_per_char"], "random_bits_per_char": report["random_bits_per_char"]}}
+    elif report.get("image"):
+        card = {"type": "image", "task": "classification", "target": "category", "winner": report["winner_label"],
+                "score": report["test"], "baseline": report["baseline_test"], "inputs": [], "classes": report["classes"]}
     else:
         card = {"type": "table", "task": report["task"], "target": report["target"], "winner": report["winner_label"],
                 "score": report["test"], "baseline": report["baseline_test"], "inputs": model_inputs(model)}
@@ -429,14 +535,42 @@ def learning_curve(events: list[dict], per_learner: int = 120) -> dict:
     return out
 
 
+def predict_image_zip(model: Trained, src: Path, out: Path, chunk: int = 500) -> int:
+    """A CSV with the predicted category of every picture in a zip."""
+    import zipfile as zf
+    import numpy as np
+    from .images import FEATURES, feature_names, features, open_image
+    z = zf.ZipFile(src)
+    names = [n for n in z.namelist() if ext_of(n) in IMAGE_EXT and not n.endswith("/") and "__MACOSX" not in n]
+    with open(out, "w", newline="", encoding="utf-8") as fo:
+        w = csv.writer(fo)
+        w.writerow(["file", "predicted category", "confidence"])
+        for i in range(0, len(names), chunk):
+            feats, ok = [], []
+            for n in names[i:i + chunk]:
+                try:
+                    feats.append(features(open_image(z.read(n))))
+                    ok.append(n)
+                except DataError:
+                    w.writerow([n, "(not a readable picture)", ""])
+            if feats:
+                X = np.stack(feats).astype(np.float64)
+                table = Table(feature_names(), [X[:, j] for j in range(FEATURES)], len(feats))
+                for n, p in zip(ok, model.predict(table)):
+                    w.writerow([n, p["prediction"], round(p["confidence"], 4)])
+    return len(names)
+
+
 def predict_table_file(model: Trained, src: Path, filename: str, out: Path, chunk: int = 50_000) -> int:
     """Predict every row of a table file, reading and writing it in pieces so any size fits in memory."""
     ext = ext_of(filename)
+    if model.report.get("image"):
+        return predict_image_zip(model, src, out)
     cls = model.task.kind == "classification"
     rows_done = 0
     with open(out, "w", newline="", encoding="utf-8") as fo:
         w = csv.writer(fo)
-        if ext in (".json", ".zip") or src.stat().st_size <= 8 << 20:
+        if ext in (".json", ".zip", ".xlsx", ".xlsm") or src.stat().st_size <= 8 << 20:
             cols, rows = read_table(src.read_bytes(), filename)
             batches = [rows[i:i + chunk] for i in range(0, len(rows), chunk)]
         else:

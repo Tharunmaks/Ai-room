@@ -5,6 +5,8 @@ Object.assign(ICONS, {
   table: '<rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 10h18M3 15h18M9 4v16"/>',
   doc: '<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4M9 12h6M9 16h6"/>',
   brain: '<path d="M9 4a3 3 0 0 0-3 3 3 3 0 0 0-2 5 3 3 0 0 0 2 5 3 3 0 0 0 3 3h1V4z"/><path d="M15 4a3 3 0 0 1 3 3 3 3 0 0 1 2 5 3 3 0 0 1-2 5 3 3 0 0 1-3 3h-1V4z"/>',
+  pencil: '<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="m13 7 4 4"/>', redo: '<path d="M20 12a8 8 0 1 1-2.3-5.6"/><path d="M20 4v5h-5"/>',
+  clip: '<rect x="6" y="4" width="12" height="17" rx="2"/><path d="M9 4h6v3H9z"/>', photo: '<rect x="3" y="5" width="18" height="14" rx="2.5"/><circle cx="9" cy="10" r="1.8"/><path d="m21 16-5-5-8 8"/>',
 });
 const LAB = {
   info: null, datasets: [], models: [], jobs: [], sel: null, ds: null, model: null, job: null, timer: null,
@@ -35,24 +37,27 @@ async function renderLab() {
     [LAB.info, LAB.datasets, LAB.models, LAB.jobs] = await Promise.all([api("/api/lab/info"), api("/api/lab/datasets"), api("/api/lab/models"), api("/api/lab/jobs")]);
   } catch (e) { el.innerHTML = `<div class="empty"><div class="big">⚠️</div>${esc(e.message)}</div>`; return; }
   el.innerHTML = `
-    <div class="page-head"><div><h2>Lab</h2><p>Upload data and brand-new, untrained models learn it from scratch on this computer — usually in seconds. Your data never leaves the machine.</p></div>
+    <div class="page-head"><div><h2>Lab</h2><p>Give it a table, some text or folders of pictures. Brand-new, untrained models learn it from scratch on this computer — usually in seconds — and your data never leaves the machine.</p></div>
       <div class="grow"></div><div class="row wrap gap-s" id="labStats"></div></div>
     <div class="lab">
       <aside class="lab-side">
         <label class="lab-drop" id="labDrop" tabindex="0">
-          <input type="file" id="labFile" hidden accept=".csv,.tsv,.tab,.json,.jsonl,.ndjson,.txt,.md,.markdown,.rst,.html,.htm,.pdf,.docx,.epub,.zip,.py,.js,.log">
+          <input type="file" id="labFile" hidden accept=".csv,.tsv,.tab,.json,.jsonl,.ndjson,.xlsx,.xlsm,.txt,.md,.markdown,.rst,.html,.htm,.pdf,.docx,.epub,.zip,.py,.js,.log">
           <span class="lab-drop-ic">${icon("upload")}</span><b>Drop a file here or click to upload</b>
-          <span class="small muted">Tables: CSV, TSV, JSON · Text: TXT, MD, HTML, PDF, DOCX, EPUB · ZIP — up to ${esc(LAB.info.max_label)} per file (${esc(LAB.info.disk_free_label)} free on this disk)</span>
+          <span class="small muted"><b>Tables</b>: Excel, CSV, TSV, JSON · <b>Text</b>: TXT, MD, HTML, PDF, DOCX, EPUB · <b>Pictures</b>: a ZIP with one folder per category — up to ${esc(LAB.info.max_label)} per file (${esc(LAB.info.disk_free_label)} free)</span>
           <span class="lab-up" id="labUp" hidden><span class="bar"><span id="labUpBar" style="width:0%"></span></span><small id="labUpTxt"></small></span>
         </label>
+        <div class="row wrap gap-s"><button class="btn sm" data-act="lab-paste">${icon("clip")} Paste a table or text</button>
+          <label class="btn sm ghost" title="Open a model downloaded from AI Room"><input type="file" id="labImport" hidden accept=".zip">${icon("download")} Import a model</label></div>
         <div class="lab-samples"><span class="small muted">No data at hand? Try one:</span><div class="row wrap gap-s" id="labSamples"></div></div>
         <div id="labLists"></div>
       </aside>
-      <section class="lab-main" id="labMain" aria-live="polite"></section>
+      <section class="lab-main"><ol class="lab-steps" id="labSteps" aria-label="Steps"></ol><div id="labMain" aria-live="polite"></div></section>
     </div>`;
   paintStats();
   $("#labSamples").innerHTML = LAB.info.samples.map((s) => `<button class="chip" data-act="lab-sample" data-arg="${s.key}" title="${esc(s.about)}">${s.icon} ${esc(s.title)}</button>`).join("");
   bindDrop();
+  $("#labImport").onchange = (e) => { importModel(e.target.files[0]); e.target.value = ""; };
   paintLists();
   const running = LAB.jobs.find((j) => j.status === "running" || j.status === "queued");
   if (running) LAB.sel = { kind: "job", id: running.id };
@@ -61,7 +66,7 @@ async function renderLab() {
 }
 function paintStats() {
   const el = $("#labStats"); if (!el) return;
-  el.innerHTML = `<span class="chip">${icon("brain")} ${plural(LAB.models.length, "model")}</span><span class="chip">${icon("table")} ${plural(LAB.datasets.length, "dataset")}</span><span class="chip" title="Training uses all CPU cores, no GPU needed">⚙️ ${LAB.info.cpus} CPU cores</span><span class="chip on" title="The fast setting gives the whole job 1 second per megabyte of data (at least 1 second)">⚡ 1 s per MB</span>`;
+  el.innerHTML = `<span class="chip">${icon("brain")} ${plural(LAB.models.length, "model")}</span><span class="chip">${icon("table")} ${plural(LAB.datasets.length, "dataset")}</span><span class="chip" title="Training uses all CPU cores, no GPU needed">⚙️ ${LAB.info.cpus} CPU cores</span><span class="chip on" title="The fast setting gives the whole job ${esc(LAB.info.rate_label)} of data (at least 1 second)">⚡ ${esc(LAB.info.rate_label)}</span>`;
 }
 function valid(sel) {
   if (sel.kind === "model") return LAB.models.some((m) => m.id === sel.id);
@@ -101,12 +106,14 @@ async function uploadData(f) {
     LAB.datasets = await api("/api/lab/datasets");
     LAB.sel = { kind: "dataset", id: data.id }; LAB.ds = data;
     paintLists(); openSel();
-    toast(`${f.name}: ${data.kind === "text" ? `${approx(data.chars, data.chars_exact)} characters` : `${approx(data.rows, data.rows_exact)} rows`}`, "ok");
+    toast(`${f.name}: ${dsSummary(data)}`, "ok");
   } catch (e) { toast(e.message, "err"); } finally {
     drop.classList.remove("busy"); $("b", drop).textContent = "Drop a file here or click to upload"; up.hidden = true;
   }
 }
 
+const dsSummary = (d) => (d.kind === "text" ? `${approx(d.chars, d.chars_exact)} characters` : d.kind === "images" ? `${(d.images || 0).toLocaleString()} pictures · ${Object.keys(d.classes || {}).length} categories`
+  : `${approx(d.rows, d.rows_exact)} rows · ${(d.columns || []).length} columns`);
 function paintLists() {
   paintStats();
   const box = $("#labLists"); if (!box) return;
@@ -116,18 +123,24 @@ function paintLists() {
     ${live.length ? `<h4 class="lab-h">Learning now</h4>${live.map((j) => `<button class="lab-item${on("job", j.id)}" data-act="lab-open" data-arg="job:${j.id}"><span class="pulse"></span><span class="grow"><b>${esc(j.dataset_name)}</b><small>${j.status === "queued" ? "waiting for the trainer" : "training…"}</small></span></button>`).join("")}` : ""}
     <h4 class="lab-h">Trained models</h4>
     ${LAB.models.map((m) => `<button class="lab-item${on("model", m.id)}" data-act="lab-open" data-arg="model:${m.id}">
-        <span class="lab-ic">${m.type === "text" ? "✍️" : m.task === "classification" ? "🏷️" : "📈"}</span>
+        <span class="lab-ic">${m.type === "text" ? "✍️" : m.type === "image" ? "🖼️" : m.task === "classification" ? "🏷️" : "📈"}</span>
         <span class="grow"><b>${esc(m.name)}</b><small>${m.type === "text" ? `${m.score.bits_per_char.toFixed(2)} bits/char` : `${scoreName(m.task)} ${fmtScore(m.task, scoreOf(m.task, m.score))}`} · ${fmtSec(m.seconds)}</small></span></button>`).join("") || `<p class="small muted">None yet. Pick a dataset and press <b>Train</b>.</p>`}
     <h4 class="lab-h">Datasets</h4>
     ${LAB.datasets.map((d) => `<button class="lab-item${on("dataset", d.id)}" data-act="lab-open" data-arg="dataset:${d.id}">
-        <span class="lab-ic">${d.kind === "text" ? "📄" : "📊"}</span>
-        <span class="grow"><b>${esc(d.name)}</b><small>${d.kind === "text" ? `${approx(d.chars, d.chars_exact)} characters` : `${approx(d.rows, d.rows_exact)} rows · ${(d.columns || []).length} columns`} · ${fmtBytes(d.bytes || 0)}</small></span></button>`).join("") || `<p class="small muted">Upload a file or try a sample.</p>`}`;
+        <span class="lab-ic">${{ text: "📄", images: "🖼️" }[d.kind] || "📊"}</span>
+        <span class="grow"><b>${esc(d.name)}</b><small>${dsSummary(d)} · ${fmtBytes(d.bytes || 0)}</small></span></button>`).join("") || `<p class="small muted">Upload a file, paste one, or try a sample.</p>`}`;
 }
 
+function paintSteps(at) {
+  const el = $("#labSteps"); if (!el) return;
+  const names = ["Add data", "Choose what to learn", "Learn", "Use it"];
+  el.innerHTML = names.map((n, i) => `<li class="${i + 1 < at ? "done" : i + 1 === at ? "now" : ""}"${i + 1 === at ? ' aria-current="step"' : ""}><span>${i + 1 < at ? "✓" : i + 1}</span>${n}</li>`).join("");
+}
 async function openSel() {
   const main = $("#labMain"); if (!main) return;
   clearTimeout(LAB.timer); LAB.timer = null;
   selSave(); paintLists();
+  paintSteps(!LAB.sel ? 1 : { dataset: 2, job: 3, model: 4 }[LAB.sel.kind]);
   if (!LAB.sel) { main.innerHTML = labWelcome(); return; }
   main.innerHTML = `<div class="skeleton" style="height:320px"></div>`;
   try {
@@ -141,7 +154,8 @@ function labWelcome() {
   return `<div class="card lab-welcome">
     <div class="lab-hero-ic">🧪</div>
     <h2>Teach a brand-new AI with your own data</h2>
-    <p class="muted">Upload a table and the Lab learns to predict any column from the others. Upload text and it learns to write like it — and to find the right passage when you ask a question.</p>
+    <p class="muted">Give it a <b>table</b> (Excel or CSV) and it learns to predict any column from the others. Give it <b>text</b> and it learns to write like it — and finds the right passage when you ask a question. Give it <b>pictures</b> in one folder per category and it learns to tell them apart.</p>
+    <div class="row wrap gap-s" style="justify-content:center;margin-top:14px"><button class="btn primary" data-act="lab-pick">${icon("upload")} Choose a file</button><button class="btn" data-act="lab-paste">${icon("clip")} Paste data</button><button class="btn" data-act="lab-sample" data-arg="houses">🏠 Try the house-prices sample</button></div>
     <div class="grid g-3" style="margin-top:18px;text-align:left">
       <div class="card flat"><h3>⚡ Starts from zero</h3><p class="small muted">Every model starts with random weights. Nothing is pre-trained; it learns only from what you upload.</p></div>
       <div class="card flat"><h3>🏁 A race of four learners</h3><p class="small muted">A one-shot net, a linear model, boosted trees and a neural network learn side by side. The best one (or a blend) wins.</p></div>
@@ -150,14 +164,32 @@ function labWelcome() {
 }
 
 /* ───────────────────────── dataset ───────────────────────── */
+function trainButton(label, bytes) {
+  return `<button class="btn primary big" data-act="lab-train">${icon("play")} ${label} <small class="lab-eta" id="labEta">≈ ${fmtSec(budgetOf(bytes, LAB.speed))}</small></button>`;
+}
 function paintDataset() {
   const d = LAB.ds, main = $("#labMain");
+  if (d.kind === "images") {
+    const classes = Object.entries(d.classes || {});
+    const most = Math.max(...classes.map(([, n]) => n)), least = Math.min(...classes.map(([, n]) => n));
+    main.innerHTML = `<div class="card lab-panel">
+      ${panelHead("🖼️", d.name, `${d.images.toLocaleString()} pictures in ${classes.length} categories · ${fmtBytes(d.bytes)}`, `dataset:${d.id}`)}
+      <p class="muted small">Each folder is a category. Every picture becomes 936 numbers — its shape (a small grey thumbnail), colour layout, edges and colour mix — and the same untrained learners as for tables learn to tell the categories apart.</p>
+      <div class="row wrap gap-s" style="margin:6px 0 12px">${classes.map(([c, n]) => `<span class="chip">${esc(c)} <small>${n.toLocaleString()}</small></span>`).join("")}</div>
+      ${least < 20 ? `<p class="small lab-warn">⚠️ Some categories have very few pictures (${least}). Twenty or more per category gives much better results.</p>` : ""}
+      ${most > least * 5 ? `<p class="small lab-warn">⚠️ The categories are very unequal (${least} to ${most} pictures); the model will lean towards the big ones.</p>` : ""}
+      <img class="lab-sheet" src="/api/lab/datasets/${d.id}/preview.png" alt="A few example pictures from each category" loading="lazy">
+      <div class="lab-go">${speedPicker(d)}${trainButton("Learn these pictures", d.bytes)}</div>
+      <p class="small muted" style="margin:12px 0 0">70% of the pictures to learn from, 15% to check progress, 15% kept back for the final test. Works best when shape and colour tell the categories apart (products, plants, symbols, scans); it is not a deep network.</p>
+    </div>`;
+    return;
+  }
   if (d.kind === "text") {
     main.innerHTML = `<div class="card lab-panel">
       ${panelHead("📄", d.name, `${approx(d.chars, d.chars_exact)} ${d.chars_exact === false ? "bytes of" : "characters ·"} ${d.chars_exact === false ? "text" : plural(d.documents, "document")} · ${fmtBytes(d.bytes)}`, `dataset:${d.id}`)}
       <p class="muted small">A text model counts which character follows every short stretch of text (1 to 10 characters), in one pass. It then writes in the style of your text, and you can search it by asking questions.</p>
       <pre class="lab-pre">${esc(d.preview_text)}${d.chars > 1500 ? "\n…" : ""}</pre>
-      <div class="row wrap" style="margin-top:16px"><button class="btn primary big" data-act="lab-train">${icon("play")} Learn this text</button><span class="small muted">Time allowed: <b>${fmtSec(budgetOf(d.bytes, "fast"))}</b> — 1 second per MB. Texts bigger than ${(32).toLocaleString()} million characters are learned from evenly spaced samples.</span></div>
+      <div class="row wrap" style="margin-top:16px">${trainButton("Learn this text", d.bytes)}<span class="small muted">${esc(LAB.info.rate_label)}, at least 1 s. Texts bigger than 32 million characters are learned from evenly spaced samples.</span></div>
     </div>`;
     return;
   }
@@ -176,12 +208,15 @@ function paintDataset() {
     <div class="lab-table-wrap" tabindex="0" aria-label="First rows of the data"><table class="lab-table"><thead><tr>${d.columns.map((c) => `<th class="${c === LAB.target ? "tgt" : ""}">${esc(c)}</th>`).join("")}</tr></thead>
       <tbody>${d.preview.slice(0, 8).map((r) => `<tr>${r.map((v, i) => `<td class="${d.columns[i] === LAB.target ? "tgt" : ""}">${esc(v.length > 60 ? v.slice(0, 58) + "…" : v)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>
     <div class="lab-go">
-      <div class="field"><span>How long may it learn? <b id="labBudget">${fmtSec(budgetOf(d.bytes, LAB.speed))}</b> for this file</span><div class="seg" id="labSpeed">${LAB.info.speeds.map((sp) => `<button type="button" class="${LAB.speed === sp.key ? "on" : ""}" data-act="lab-speed" data-arg="${sp.key}">${{ fast: "⚡ Fast", balanced: "⚖️ Balanced", thorough: "🔬 Thorough" }[sp.key]} <small>${esc(sp.label)}</small></button>`).join("")}</div></div>
-      <button class="btn primary big" data-act="lab-train">${icon("play")} Train from scratch</button>
+      ${speedPicker(d)}
+      ${trainButton("Train from scratch", d.bytes)}
     </div>
-    <p class="small muted" style="margin:12px 0 0">It splits the rows first: 70% to learn from, 15% to check progress, and 15% locked away for the final, honest test. Fast gives the whole job — reading, learning, testing, saving — 1 second per MB (at least 1 s).${d.rows < 200 ? " With so few rows, scores will jump around — more data helps more than anything." : ""}${d.rows_exact === false ? " If the rows do not fit in memory, it learns from a random sample of them." : ""}</p>
+    <p class="small muted" style="margin:12px 0 0">It splits the rows first: 70% to learn from, 15% to check progress, and 15% locked away for the final, honest test. Fast gives the whole job — reading, learning, testing, saving — ${esc(LAB.info.rate_label)} of data (at least 1 s).${d.rows < 200 ? " With so few rows, scores will jump around — more data helps more than anything." : ""}${d.rows_exact === false ? " If the rows do not fit in memory, it learns from a random sample of them." : ""}</p>
   </div>`;
   $("#labTarget").onchange = (e) => { LAB.target = e.target.value; LAB.ignore.delete(LAB.target); paintDataset(); };
+}
+function speedPicker(d) {
+  return `<div class="field"><span>How long may it learn? <b id="labBudget">${fmtSec(budgetOf(d.bytes, LAB.speed))}</b> for this file</span><div class="seg" id="labSpeed">${LAB.info.speeds.map((sp) => `<button type="button" class="${LAB.speed === sp.key ? "on" : ""}" data-act="lab-speed" data-arg="${sp.key}" title="${sp.key === "fast" ? "The default: quickest" : "More time can help small files a little"}">${{ fast: "⚡ Fast", balanced: "⚖️ Balanced", thorough: "🔬 Thorough" }[sp.key]} <small>${esc(sp.label)}</small></button>`).join("")}</div></div>`;
 }
 function taskHelp(tp) {
   if (!tp) return "";
@@ -197,9 +232,38 @@ function colChips(d) {
     return `<button class="chip lab-col${out ? " off" : ""}" data-act="lab-col" data-arg="${esc(p.name)}" aria-pressed="${!out}" title="${out ? "Left out — click to use it" : "Click to leave it out"}">${esc(p.name)} <small>${p.kind}${p.missing > 0.005 ? ` · ${Math.round(p.missing * 100)}% blank` : ""}</small></button>`;
   }).join("");
 }
-function panelHead(ic, title, sub, del) {
+function panelHead(ic, title, sub, del, actions = "") {
   return `<div class="lab-head"><span class="lab-big-ic">${ic}</span><div class="grow"><h3>${esc(title)}</h3><div class="small muted">${sub}</div></div>
-    ${del ? `<button class="btn sm ghost danger" data-act="lab-del" data-arg="${del}" aria-label="Delete">${icon("trash")}</button>` : ""}</div>`;
+    <div class="row gap-s lab-actions">${actions}${del ? `<button class="btn sm ghost danger" data-act="lab-del" data-arg="${del}" aria-label="Delete" title="Delete">${icon("trash")}</button>` : ""}</div></div>`;
+}
+function modelActions(m) {
+  const ds = LAB.datasets.find((d) => d.id === m.dataset);
+  return `<button class="btn sm ghost" data-act="lab-rename" title="Rename">${icon("pencil")}<span class="hide-sm">Rename</span></button>
+    <a class="btn sm ghost" href="/api/lab/models/${m.id}/download" download title="Download the model as a .zip to keep or share">${icon("download")}<span class="hide-sm">Download</span></a>
+    <button class="btn sm ghost" data-act="lab-retrain" ${ds ? "" : 'disabled title="The data it learned from was deleted"'} title="Change settings and train again on the same data">${icon("redo")}<span class="hide-sm">Train again</span></button>`;
+}
+/* How good is it, in words? Compared with what guessing gets, so it means the same for every kind of data. */
+function verdict(kind, r) {
+  let g;
+  if (kind === "text") g = 1 - r.valid_bits_per_char / r.random_bits_per_char;
+  else if (r.task === "classification") { const a = r.test.accuracy, b = r.baseline_test?.accuracy ?? 0; g = (a - b) / Math.max(1e-9, 1 - b); }
+  else g = r.test.r2;
+  const [label, cls, ic] = kind === "text"
+    ? (g >= 0.7 ? ["Excellent", "good", "★"] : g >= 0.55 ? ["Good", "good", "✓"] : g >= 0.35 ? ["Fair", "warn", "≈"] : ["Weak", "bad", "!"])
+    : (g >= 0.8 ? ["Excellent", "good", "★"] : g >= 0.5 ? ["Good", "good", "✓"] : g >= 0.2 ? ["Fair", "warn", "≈"] : ["Weak", "bad", "!"]);
+  return { g, label, cls, ic };
+}
+function summaryHTML(kind, m) {
+  const r = m.report, v = verdict(kind, r);
+  let text;
+  if (kind === "text") text = `It learned ${(r.learned_chars || r.chars).toLocaleString()} characters and predicts the next one using <b>${r.valid_bits_per_char.toFixed(2)} bits</b> — random guessing would need ${r.random_bits_per_char.toFixed(2)}. Use it to write in the style of your text, or to find passages.`;
+  else if (r.task === "classification") {
+    const a = r.test.accuracy, b = r.baseline_test?.accuracy ?? 0, what = kind === "image" ? "pictures" : "rows";
+    text = `It gets <b>${(a * 100).toFixed(1)}%</b> of new ${what} right — ${Math.round(a * r.split.test)} of ${r.split.test.toLocaleString()} it had never seen. Always guessing the most common ${kind === "image" ? "category" : "answer"} would get ${(b * 100).toFixed(1)}%.`;
+  } else text = `Its <b>${esc(r.target)}</b> predictions are usually within <b>±${fmtNum(r.test.mae)}</b> of the real value on rows it had never seen, and it explains <b>${Math.max(0, r.test.r2 * 100).toFixed(0)}%</b> of the differences between rows.`;
+  const tips = v.label === "Weak" || v.label === "Fair"
+    ? `<ul class="lab-tips"><li>More ${kind === "image" ? "pictures per category" : kind === "text" ? "text" : "rows"} usually helps most.</li>${kind === "text" ? "" : `<li>Try <b>Thorough</b> (Train again) to give the learners more time.</li>`}${kind === "table" ? `<li>Check that the other columns can really predict “${esc(r.target)}”, and leave out any that cannot.</li>` : ""}</ul>` : "";
+  return `<div class="lab-summary"><span class="lab-badge ${v.cls}" title="Compared with guessing">${v.ic} ${v.label}</span><p>${text}</p>${tips}</div>`;
 }
 
 /* ───────────────────────── training (live) ───────────────────────── */
@@ -245,14 +309,17 @@ function paintJob(full) {
   const task = j.all.find((e) => e.task)?.task || "classification";
   if (full || !$("#labJob")) {
     main.innerHTML = `<div class="card lab-panel" id="labJob">
-      <div class="lab-head"><span class="lab-big-ic">${j.kind === "text" ? "✍️" : "🏁"}</span><div class="grow"><h3 id="labJobTitle"></h3><div class="small muted" id="labJobSub"></div></div>
+      <div class="lab-head"><span class="lab-big-ic">${{ text: "✍️", images: "🖼️" }[j.kind] || "🏁"}</span><div class="grow"><h3 id="labJobTitle"></h3><div class="small muted" id="labJobSub"></div></div>
         <button class="btn sm" data-act="lab-stop" id="labStop">${icon("stop")} Stop</button></div>
+      <div class="lab-time" id="labTime" hidden><span class="bar"><span id="labTimeBar"></span></span></div>
       <ol class="lab-stages" id="labStages"></ol>
       <div id="labRace"></div><div id="labChart"></div><div id="labJobErr"></div></div>`;
   }
   $("#labJobTitle").innerHTML = `${live ? '<span class="pulse"></span> ' : ""}${j.status === "queued" ? "Waiting for the trainer…" : live ? `Learning ${esc(j.dataset_name)}…` : j.status === "done" ? `Learned ${esc(j.dataset_name)}` : j.status === "stopped" ? "Stopped" : "Something went wrong"}`;
-  $("#labJobSub").textContent = `${fmtSec(elapsed)}${j.budget ? ` of ${fmtSec(j.budget)} allowed (${j.speed === "fast" ? "1 s per MB" : j.speed})` : ""}`;
+  $("#labJobSub").textContent = `${fmtSec(elapsed)}${j.budget ? ` of ${fmtSec(j.budget)} allowed (${j.speed === "fast" ? LAB.info.rate_label : j.speed})` : ""}`;
   $("#labStop").hidden = !live;
+  if (j.budget) { $("#labTime").hidden = false; $("#labTimeBar").style.width = `${Math.min(100, (100 * elapsed) / j.budget).toFixed(1)}%`; }
+  paintSteps(live ? 3 : 4);
   $("#labStages").innerHTML = stages.slice(-4).map((s, i, a) => `<li class="${i === a.length - 1 && live ? "now" : ""}">${esc(s)}</li>`).join("");
   if (j.kind !== "text" && order.length) {
     const base = L.baseline;
@@ -271,37 +338,43 @@ function paintJob(full) {
 function paintModel() {
   const m = LAB.model;
   if (m.type === "text") return paintTextModel();
-  const r = m.report, main = $("#labMain"), task = r.task;
+  const r = m.report, main = $("#labMain"), task = r.task, img = m.type === "image";
   const test = scoreOf(task, r.test), base = scoreOf(task, r.baseline_test);
   const classes = r.classes || [];
   main.innerHTML = `<div class="stack" style="gap:16px">
     <div class="card lab-panel">
-      ${panelHead(task === "classification" ? "🏷️" : "📈", m.name, `Predicts <b>${esc(r.target)}</b> (${task === "classification" ? `one of ${classes.length} categories` : "a number"}) · winner: ${esc(r.winner_label)}`, `model:${m.id}`)}
+      ${panelHead(img ? "🖼️" : task === "classification" ? "🏷️" : "📈", m.name, img ? `Tells apart ${classes.length} kinds of picture: ${classes.slice(0, 6).map(esc).join(", ")}${classes.length > 6 ? "…" : ""} · winner: ${esc(r.winner_label)}`
+        : `Predicts <b>${esc(r.target)}</b> (${task === "classification" ? `one of ${classes.length} categories` : "a number"}) · winner: ${esc(r.winner_label)}`, `model:${m.id}`, modelActions(m))}
+      ${summaryHTML(img ? "image" : "table", m)}
       <div class="lab-tiles">
-        ${tile(task === "classification" ? "Accuracy on unseen rows" : "R² on unseen rows", fmtScore(task, test), task === "classification" ? `${Math.round(test * r.split.test)} of ${r.split.test} rows right` : `typical error ±${fmtNum(r.test.mae)}`, true)}
+        ${tile(task === "classification" ? `Accuracy on unseen ${img ? "pictures" : "rows"}` : "R² on unseen rows", fmtScore(task, test), task === "classification" ? `${Math.round(test * r.split.test)} of ${r.split.test} right` : `typical error ±${fmtNum(r.test.mae)}`, true)}
         ${tile("Without learning", fmtScore(task, base), task === "classification" ? "always the most common answer" : "always the average")}
-        ${tile("Learned in", fmtSec(m.seconds), m.budget ? `of ${fmtSec(m.budget)} allowed · ${r.split.train.toLocaleString()} rows` : `from ${r.split.train.toLocaleString()} rows`)}
+        ${tile("Learned in", fmtSec(m.seconds), m.budget ? `of ${fmtSec(m.budget)} allowed · ${r.split.train.toLocaleString()} ${img ? "pictures" : "rows"}` : `from ${r.split.train.toLocaleString()} ${img ? "pictures" : "rows"}`)}
         ${tile("First model ready", fmtSec(r.first_model_seconds), "the one-shot net needs no epochs")}
       </div>
       ${r.sampled ? `<p class="small muted" style="margin:10px 0 0">The file has ${approx(r.file_rows, r.rows_exact)} rows — more than fit in memory — so it learned from a random sample of ${r.rows.toLocaleString()}.</p>` : ""}
       ${r.ignored?.length ? `<p class="small muted" style="margin:10px 0 0">Not used: ${r.ignored.map((i) => `<b>${esc(i.name)}</b> (${esc(i.why)})`).join(", ")}.</p>` : ""}
     </div>
     <div class="grid g-2 lab-grid">
-      <div class="card"><h3>${icon("sparkles")} Try it</h3><form data-form="lab-predict" id="labForm" class="lab-form">${m.inputs.map(inputField).join("")}
-        <div class="row" style="grid-column:1/-1"><button class="btn primary" type="submit">${icon("play")} Predict ${esc(r.target)}</button></div></form>
+      <div class="card"><h3>${icon("sparkles")} Try it</h3>${img
+        ? `<label class="lab-drop lab-pic-drop" id="labPicDrop" tabindex="0"><input type="file" id="labPic" hidden accept="image/*"><span class="lab-drop-ic">${icon("photo")}</span><b>Drop a picture here or click to choose one</b><span class="small muted">It answers which category it belongs to, and how sure it is.</span></label><div id="labForm"></div>`
+        : `<form data-form="lab-predict" id="labForm" class="lab-form">${m.inputs.map(inputField).join("")}
+        <div class="row" style="grid-column:1/-1"><button class="btn primary" type="submit">${icon("play")} Predict ${esc(r.target)}</button></div></form>`}
         <div id="labOut" class="lab-out" aria-live="polite"></div></div>
       <div class="card"><h3>🏁 Which learner won</h3><div id="labBoard"></div>
         <p class="small muted" style="margin:10px 0 0">Every learner started untrained. The winner is picked on the progress-check rows; the bars show the locked-away test rows.</p></div>
     </div>
     ${m.curve && Object.keys(m.curve).length ? `<div class="card"><h3>📉 How fast each one learned</h3><div id="labCurve"></div></div>` : ""}
     <div class="grid g-2 lab-grid">
-      <div class="card"><h3>🔎 What it pays attention to</h3><div id="labImp"></div><p class="small muted" style="margin:10px 0 0">How much worse it gets when a column's values are shuffled between rows.</p></div>
+      <div class="card"><h3>🔎 What it pays attention to</h3><div id="labImp"></div><p class="small muted" style="margin:10px 0 0">${img ? "How much worse it gets when one kind of feature (shape, colours, edges) is shuffled between pictures." : "How much worse it gets when a column's values are shuffled between rows."}</p></div>
       ${task === "classification" && classes.length <= 12 && r.test.confusion ? `<div class="card"><h3>🧩 Where it gets confused</h3><div id="labConf"></div></div>` : `<div class="card"><h3>📏 Errors</h3>${errorsHTML(r)}</div>`}
     </div>
     <div class="grid g-2 lab-grid">
-      <div class="card"><h3>${icon("table")} Predict a whole file</h3><p class="small muted">Upload a CSV with the same columns (the ${esc(r.target)} column may be missing). You get the same file back with a prediction on every row.</p>
-        <label class="btn"><input type="file" id="labBatch" hidden accept=".csv,.tsv,.json,.jsonl,.txt">${icon("upload")} Choose a file…</label></div>
-      <div class="card"><h3>${icon("link")} Use it from your own code</h3><pre class="lab-pre small">${esc(curlExample(m))}</pre></div>
+      <div class="card"><h3>${icon("table")} ${img ? "Sort a whole folder of pictures" : "Predict a whole file"}</h3><p class="small muted">${img ? "Upload a .zip of pictures. You get back a spreadsheet (CSV) with the category of each one."
+        : `Upload an Excel or CSV file with the same columns (the ${esc(r.target)} column may be missing). You get it back as CSV with a prediction on every row.`}</p>
+        <label class="btn"><input type="file" id="labBatch" hidden accept="${img ? ".zip" : ".csv,.tsv,.json,.jsonl,.txt,.xlsx,.xlsm"}">${icon("upload")} Choose a file…</label></div>
+      <div class="card"><h3>${icon("link")} Use it from your own code</h3><pre class="lab-pre small">${esc(img ? `curl -s ${location.origin}/api/lab/models/${m.id}/predict_image \\
+  --data-binary @photo.jpg` : curlExample(m))}</pre></div>
     </div></div>`;
   barBoard($("#labBoard"), r.leaderboard.filter((b) => b.learner !== "baseline"), task, r.winner);
   LAB.redraw = () => $("#labCurve") && lineChart($("#labCurve"), Object.entries(m.curve).filter(([k]) => k !== "baseline").map(([k, pts]) => ({ key: k, name: LEARNERS[k]?.label || k, color: seriesVar(k), pts })),
@@ -310,6 +383,26 @@ function paintModel() {
   importanceBars($("#labImp"), r.importance);
   if ($("#labConf")) confusion($("#labConf"), r.test.confusion, classes);
   $("#labBatch").onchange = (e) => batchPredict(e.target.files[0]);
+  if (img) {
+    const drop = $("#labPicDrop"), file = $("#labPic");
+    file.onchange = () => { if (file.files[0]) predictPicture(file.files[0]); file.value = ""; };
+    drop.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); file.click(); } };
+    ["dragenter", "dragover"].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+    ["dragleave", "drop"].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
+    drop.addEventListener("drop", (e) => { const f = e.dataTransfer.files[0]; if (f) predictPicture(f); });
+  }
+}
+async function predictPicture(f) {
+  const out = $("#labOut"), url = URL.createObjectURL(f);
+  out.innerHTML = `<div class="skeleton" style="height:90px"></div>`;
+  try {
+    const r = await fetch(`/api/lab/models/${LAB.model.id}/predict_image`, { method: "POST", body: f });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(typeof d.detail === "string" ? d.detail : "Could not read that picture");
+    const p = d.prediction;
+    out.innerHTML = `<div class="lab-pic-answer"><img src="${url}" alt="The picture you chose"><div class="lab-answer grow"><span class="muted small">This looks like</span><b>${esc(p.prediction)}</b><small>${Math.round(p.confidence * 100)}% sure · ${fmtSec(d.seconds)}</small></div></div>
+      <div class="lab-probs">${p.top.map((t, i) => `<div class="lab-prob"><span class="nm">${esc(t.label)}</span><span class="track"><span style="width:${Math.max(1, t.p * 100)}%;${i ? "opacity:.55" : ""}"></span></span><span class="v">${(t.p * 100).toFixed(1)}%</span></div>`).join("")}</div>`;
+  } catch (e) { out.innerHTML = `<div class="lab-err">${esc(e.message)}</div>`; }
 }
 function tile(label, value, sub, hero = false) {
   return `<div class="lab-tile${hero ? " hero" : ""}"><span class="lbl">${esc(label)}</span><b>${esc(value)}</b><small>${esc(sub)}</small></div>`;
@@ -346,7 +439,7 @@ async function batchPredict(f) {
     const r = await fetch(`/api/lab/models/${LAB.model.id}/predict_file?filename=${encodeURIComponent(f.name)}`, { method: "POST", body: f });
     if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || "Prediction failed"); }
     const blob = await r.blob(), a = document.createElement("a");
-    a.href = URL.createObjectURL(blob); a.download = f.name.replace(/\.[^.]+$/, "") + "_predicted.csv"; a.click();
+    a.href = URL.createObjectURL(blob); a.download = f.name.replace(/\.[^.]+$/, "") + "_predicted.csv"; document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 4000);
     toast("Predictions downloaded", "ok");
   } catch (e) { toast(e.message, "err"); }
@@ -365,9 +458,10 @@ function paintTextModel() {
   const m = LAB.model, r = m.report, main = $("#labMain");
   main.innerHTML = `<div class="stack" style="gap:16px">
     <div class="card lab-panel">
-      ${panelHead("✍️", m.name, `Learned ${r.chars.toLocaleString()} characters from ${plural(r.documents, "document")} · ${r.vocab} different characters`, `model:${m.id}`)}
+      ${panelHead("✍️", m.name, `Learned ${r.chars.toLocaleString()} characters from ${plural(r.documents, "document")} · ${r.vocab} different characters`, `model:${m.id}`, modelActions(m))}
+      ${summaryHTML("text", m)}
       <div class="lab-tiles">
-        ${tile("Bits per character", r.valid_bits_per_char.toFixed(2), "on the last tenth, held back", true)}
+        ${tile("Bits per character", r.valid_bits_per_char.toFixed(2), "on held-back text (lower is better)", true)}
         ${tile("Random guessing", r.random_bits_per_char.toFixed(2), "bits per character")}
         ${tile("Learned in", fmtSec(m.seconds || r.seconds), m.budget ? `of ${fmtSec(m.budget)} allowed · ${(r.learned_chars || r.chars).toLocaleString()} characters` : `${Math.round(r.chars_per_second).toLocaleString()} characters a second`)}
         ${tile("Looks back", `${r.order}`, "characters — the context that predicted best")}
@@ -522,8 +616,69 @@ function orderChart(el, bits, chosen, random) {
   hoverTips($(".lab-chart", el));
 }
 
+/* ───────────────────────── small dialogs ───────────────────────── */
+function labDialog(title, body, okLabel, onOk) {
+  const m = $("#modal");
+  m.innerHTML = `<div class="mh"><h3 style="font-size:18px">${title}</h3><button class="btn icon ghost" style="margin-left:auto" data-close aria-label="Close">${icon("x")}</button></div>
+    <div class="mb">${body}</div><div class="mf"><span class="grow"></span><button class="btn" data-close>Cancel</button><button class="btn primary" id="labDlgOk">${okLabel}</button></div>`;
+  m.style.width = "";
+  $$("[data-close]", m).forEach((b) => (b.onclick = () => m.close()));
+  $("#labDlgOk").onclick = async () => { if ((await onOk(m)) !== false) m.close(); };
+  m.showModal();
+  return m;
+}
+/* Pasted text becomes a file: tab-separated (copied from Excel or Sheets), comma-separated, or plain text. */
+function pastedFile(text, name) {
+  const lines = text.replace(/\r/g, "").split("\n").filter((l) => l.trim());
+  const consistent = (sep) => lines.length >= 3 && lines[0].split(sep).length >= 2 && lines.slice(0, 50).every((l) => l.split(sep).length === lines[0].split(sep).length);
+  const ext = consistent("\t") ? ".tsv" : consistent(",") || consistent(";") ? ".csv" : ".txt";
+  const base = (name || "pasted").trim().replace(/[^\w .-]+/g, "_").replace(/\.[A-Za-z0-9]+$/, "") || "pasted";
+  return new File([text], base + ext, { type: "text/plain" });
+}
+async function importModel(f) {
+  if (!f) return;
+  try {
+    const r = await fetch("/api/lab/models/import", { method: "POST", body: f });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(typeof d.detail === "string" ? d.detail : "Import failed");
+    LAB.models = await api("/api/lab/models"); LAB.sel = { kind: "model", id: d.id }; openSel();
+    toast(`Imported “${d.name}”`, "ok");
+  } catch (e) { toast(e.message, "err"); }
+}
+
 /* ───────────────────────── actions ───────────────────────── */
 Object.assign(ACTIONS, {
+  "lab-pick"() { $("#labFile")?.click(); },
+  "lab-paste"() {
+    labDialog("Paste a table or some text", `<p class="small muted" style="margin-top:0">Copy cells from Excel or Google Sheets (with the header row), comma-separated lines, or any text — then paste here.</p>
+      <label class="field"><span>Name</span><input type="text" id="labPasteName" placeholder="my data" value="pasted data"></label>
+      <label class="field" style="margin-top:10px"><span>Data</span><textarea id="labPasteText" rows="12" placeholder="name&#9;age&#9;city&#10;Ana&#9;31&#9;Lisbon&#10;…" style="font-family:var(--mono)"></textarea></label>
+      <p class="small muted" id="labPasteKind" style="margin:8px 0 0"></p>`, `${icon("upload")} Use it`, async () => {
+      const text = $("#labPasteText").value;
+      if (!text.trim()) { $("#labPasteKind").textContent = "Paste something first."; return false; }
+      await uploadData(pastedFile(text, $("#labPasteName").value));
+    });
+    const show = () => { const f = pastedFile($("#labPasteText").value, "x"); $("#labPasteKind").textContent = $("#labPasteText").value.trim() ? `Looks like ${f.name.endsWith(".txt") ? "text — it will learn to write like it" : "a table — you will pick a column to predict next"}.` : ""; };
+    $("#labPasteText").addEventListener("input", debounce(show, 200));
+    setTimeout(() => $("#labPasteText").focus(), 50);
+  },
+  "lab-rename"() {
+    const m = LAB.model;
+    labDialog("Rename this model", `<label class="field"><span>Name</span><input type="text" id="labNewName" maxlength="80" value="${esc(m.name)}"></label>`, "Save", async () => {
+      try {
+        const c = await api(`/api/lab/models/${m.id}`, { method: "PATCH", body: { name: $("#labNewName").value } });
+        LAB.model.name = c.name; LAB.models = await api("/api/lab/models"); paintLists(); paintModel();
+      } catch (e) { toast(e.message, "err"); return false; }
+    });
+    setTimeout(() => { const i = $("#labNewName"); i.focus(); i.select(); }, 50);
+  },
+  "lab-retrain"() {
+    const m = LAB.model;
+    if (!LAB.datasets.some((d) => d.id === m.dataset)) { toast("The data this model learned from has been deleted.", "err"); return; }
+    if (m.report?.target && m.type === "table") { LAB.target = m.report.target; LAB.dsId = m.dataset; LAB.ignore = new Set((m.report.ignored || []).filter((i) => i.why === "ignored by you").map((i) => i.name)); }
+    LAB.sel = { kind: "dataset", id: m.dataset }; openSel();
+    toast("Change any setting, then press Train.", "");
+  },
   async "lab-sample"(key) {
     try {
       const d = await api(`/api/lab/samples/${key}`, { method: "POST" });
@@ -532,7 +687,10 @@ Object.assign(ACTIONS, {
   },
   "lab-open"(arg) { const [kind, id] = arg.split(":"); LAB.sel = { kind, id }; openSel(); if (innerWidth < 1000) $("#labMain")?.scrollIntoView({ behavior: "smooth" }); },
   "lab-task"(k) { LAB.task = k; paintDataset(); },
-  "lab-speed"(k) { LAB.speed = k; store.set("lab.speed", k); $$("#labSpeed button").forEach((b) => b.classList.toggle("on", b.dataset.arg === k)); if ($("#labBudget") && LAB.ds) $("#labBudget").textContent = fmtSec(budgetOf(LAB.ds.bytes, k)); },
+  "lab-speed"(k) {
+    LAB.speed = k; store.set("lab.speed", k); $$("#labSpeed button").forEach((b) => b.classList.toggle("on", b.dataset.arg === k));
+    if (LAB.ds) { const t = fmtSec(budgetOf(LAB.ds.bytes, k)); if ($("#labBudget")) $("#labBudget").textContent = t; if ($("#labEta")) $("#labEta").textContent = `≈ ${t}`; }
+  },
   "lab-col"(name) { LAB.ignore.has(name) ? LAB.ignore.delete(name) : LAB.ignore.add(name); $("#labCols").innerHTML = colChips(LAB.ds); },
   async "lab-train"() {
     const d = LAB.ds;

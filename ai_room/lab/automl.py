@@ -19,15 +19,17 @@ import numpy as np
 from .data import DataError, Encoder, Table, XData, cell_str, missing_mask, pick_target, pick_task, profile, to_float, to_floats
 from .learners import Baseline, Boosted, Learner, Neural, OneShot, Task, linear, log_loss
 
-SECONDS_PER_MB = 1.0
-# fast: the whole job (reading, learning, testing, saving) gets 1 second per MB of data, at least 1 second.
-# balanced / thorough: at least 30 s / 2 min, for more accuracy on small files (never less than 1 s per MB).
+SECONDS_PER_GB = 600.0                       # 10 minutes per gigabyte
+SECONDS_PER_MB = SECONDS_PER_GB / 1000.0     # = 0.6 s per MB (1 GB = 1,000 MB = 10^9 bytes)
+RATE_LABEL = "10 min per GB"
+# fast: the whole job (reading, learning, testing, saving) gets 10 minutes per GB of data, at least 1 second.
+# balanced / thorough: at least 30 s / 2 min, for more accuracy on small files (never less than the fast budget).
 SPEEDS = {"fast": 1.0, "balanced": 30.0, "thorough": 120.0}
-SPEED_LABELS = {"fast": "1 s per MB", "balanced": "≈30 s", "thorough": "≈2 min"}
+SPEED_LABELS = {"fast": RATE_LABEL, "balanced": "≈30 s", "thorough": "≈2 min"}
 
 
 def budget_for(speed: str, size_bytes: float) -> float:
-    """Seconds a training job may take: 1 s per MB (1 MB = 1,000,000 bytes), at least SPEEDS[speed]."""
+    """Seconds a training job may take: 10 minutes per GB (0.6 s per MB), at least SPEEDS[speed]."""
     speed = "fast" if speed == "quick" else speed
     per_mb = max(1.0, size_bytes / 1e6 * SECONDS_PER_MB)
     return per_mb if speed == "fast" else max(SPEEDS.get(speed, 30.0), per_mb)
@@ -218,7 +220,7 @@ def prepare_target(table, rows=None, target: str | None = None, task: str = "aut
 
 def train_table(columns, rows=None, target: str | None = None, task: str = "auto", ignore=(),
                 budget: float = 30.0, learners: list[str] | None = None, seed: int = 0, progress=None, stop=None,
-                deadline: float | None = None) -> Trained:
+                deadline: float | None = None, image: bool = False) -> Trained:
     """Learn to predict `target` from the other columns. `columns` may be a Table (then `rows` is None).
 
     Everything, from reading the columns to the final score, is fitted into `budget` seconds (or until the
@@ -314,7 +316,11 @@ def train_table(columns, rows=None, target: str | None = None, task: str = "auto
     model = Trained(T, target, labels, y_mu, y_sd, enc, [f[0] for f in choice], weights)
     name = " + ".join(f[0].label for f in choice)
     say(f"Winner: {name}. Measuring which columns it relies on…")
-    importance = permutation_importance(model, Xva, yva, enc, used, until=deadline - 0.02 * total_budget)
+    groups = None
+    if image:                      # pictures: importance per kind of feature (shape, colours, edges), not per pixel
+        from .images import GROUPS, groups as image_groups
+        groups = image_groups()
+    importance = permutation_importance(model, Xva, yva, enc, used, until=deadline - 0.02 * total_budget, groups=groups)
     total = time.perf_counter() - t_start
     model.report = {
         "target": target, "task": T.kind, "classes": labels, "rows": n, "file_rows": table.total_rows, "rows_exact": table.exact, "sampled": table.sampled,
@@ -326,12 +332,17 @@ def train_table(columns, rows=None, target: str | None = None, task: str = "auto
         "seconds_total": round(total, 3), "seconds_learning": round(time.perf_counter() - t_models, 3), "budget": round(total_budget, 3),
         "first_model_seconds": next((r["seconds"] for r in board if r["learner"] != "baseline"), None),
     }
+    if image:
+        model.report["image"] = {"groups": list(GROUPS), "pictures": n}
+        model.report["profile"] = []                     # 936 number columns: not worth keeping
+        model.report["ignored"] = []
+        model.report["columns_used"] = list(GROUPS)
     emit({"type": "done", "report": model.report})
     return model
 
 
 def permutation_importance(model: Trained, X: XData, y: np.ndarray, enc: Encoder, columns: list[str], seed: int = 0,
-                           until: float | None = None) -> list[dict]:
+                           until: float | None = None, groups: dict[str, list[str]] | None = None) -> list[dict]:
     """How much the validation score drops when one column's values are shuffled between rows (stops at `until`)."""
     if X.n < 5:
         return []
@@ -344,6 +355,9 @@ def permutation_importance(model: Trained, X: XData, y: np.ndarray, enc: Encoder
     loss = (lambda p: log_loss(p, y)) if T.kind == "classification" else (lambda p: float(((p - y) ** 2).mean()))
     b = loss(base)
     slices = enc.column_slices()
+    if groups:                     # shuffle whole groups of columns together
+        slices = {g: [i for c in cols for i in slices.get(c, [])] for g, cols in groups.items()}
+        columns = [g for g in groups if slices[g]]
     out = []
     for c in columns[:80]:
         if until is not None and time.perf_counter() > until:

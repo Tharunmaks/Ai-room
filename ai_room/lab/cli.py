@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 from .api import write_card
-from .automl import SECONDS_PER_MB, SPEEDS, Trained, budget_for, new_id, train_table
+from .automl import RATE_LABEL, SPEEDS, Trained, budget_for, new_id, train_table
 from .data import DataError
 from .ingest import human, load_table, load_text, sniff_path
 from .textgen import MAX_CHARS, TextModel, train_text
@@ -65,17 +65,21 @@ def cmd_train(a) -> None:
     say = lambda text: show({"type": "stage", "text": text})
     try:
         kind = sniff_path(path, path.name)
-        print(f"Learning {path.name} ({human(size)}) from scratch as {'text' if kind == 'text' else 'a table'}; "
-              f"time allowed: {budget:.1f} s ({SECONDS_PER_MB:g} s per MB{', at least 1 s' if budget <= 1 else ''}) …", flush=True)
+        print(f"Learning {path.name} ({human(size)}) from scratch as {dict(text='text', images='pictures').get(kind, 'a table')}; "
+              f"time allowed: {budget:.1f} s ({RATE_LABEL}{', at least 1 s' if budget <= 1 else ''}) …", flush=True)
         if kind == "text":
             docs, _ = load_text(path, path.name, MAX_CHARS, say=say)
             model = train_text(docs, progress=show, deadline=deadline - 0.12 * budget)
+        elif kind == "images":
+            from .images import load_image_zip
+            table = load_image_zip(path, deadline=t0 + 0.45 * budget, say=say)
+            model = train_table(table, None, "category", task="classification", progress=show, deadline=deadline - 0.03 * budget, image=True)
         elif kind == "table":
             table = load_table(path, path.name, say=say)
             model = train_table(table, None, a.target, task=a.task, ignore=[c.strip() for c in (a.ignore or "").split(",") if c.strip()],
                                 progress=show, deadline=deadline - 0.03 * budget)
         else:
-            raise SystemExit("Folders of images are not supported yet.")
+            raise SystemExit("That kind of file cannot be learned yet: use a table, a text, or a .zip of pictures in one folder per category.")
     except (DataError, ValueError) as e:
         raise SystemExit(str(e))
     folder = Path(a.out) if a.out else lab_dir(a.data) / "models" / new_id()
@@ -107,6 +111,12 @@ def cmd_predict(a) -> None:
     if isinstance(m, TextModel):
         raise SystemExit("That is a text model: use `ai-room lab write` or `ai-room lab ask`.")
     path = Path(a.file)
+    from .data import IMAGE_EXT, ext_of
+    if m.report.get("image") and ext_of(path.name) in IMAGE_EXT:          # one picture: print the answer
+        from .images import image_table
+        p = m.predict(image_table([path.read_bytes()]))[0]
+        print(f"{path.name}: {p['prediction']} ({p['confidence']:.0%} sure) — " + ", ".join(f"{t['label']} {t['p']:.0%}" for t in p["top"]))
+        return
     out = Path(a.out) if a.out else None
     import tempfile
     target = out or Path(tempfile.mkstemp(suffix=".csv")[1])
@@ -166,7 +176,7 @@ def add_parser(sub) -> None:
     t.add_argument("--task", choices=["auto", "classification", "regression"], default="auto")
     t.add_argument("--ignore", help="comma-separated columns to leave out")
     t.add_argument("--speed", choices=list(SPEEDS) + ["quick"], default="fast",
-                   help="time allowed: fast = 1 s per MB of data (at least 1 s); balanced ≥ 30 s; thorough ≥ 2 min")
+                   help="time allowed: fast = 10 min per GB of data (0.6 s per MB, at least 1 s); balanced ≥ 30 s; thorough ≥ 2 min")
     t.add_argument("--name")
     t.add_argument("--out", help="folder to save the model in (default: data/lab/models/<id>)")
     p = ls.add_parser("predict", help="add predictions to every row of a table")

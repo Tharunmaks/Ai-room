@@ -16,6 +16,10 @@ SAMPLES = {
                 "about": "Points on two interleaved spirals. A straight line cannot separate them; a model that learns curves can."},
     "reviews": {"title": "Product reviews", "icon": "💬", "kind": "table", "target": "sentiment",
                 "about": "1,600 short reviews. Learn from the words whether a review is positive or negative."},
+    "churn": {"title": "Customer churn", "icon": "📉", "kind": "table", "target": "left",
+              "about": "3,000 made-up customers with sign-up dates, plans and support calls. Predict who will leave."},
+    "shapes": {"title": "Shapes (pictures)", "icon": "🔺", "kind": "images",
+               "about": "600 small drawings of circles, squares and triangles in a zip of folders. Learn to tell them apart."},
     "code": {"title": "Python code", "icon": "🐍", "kind": "text",
              "about": "AI Room's own source code (about 1 MB). The model learns to write text that looks like it."},
 }
@@ -90,6 +94,54 @@ def reviews(n: int = 1600, seed: int = 11) -> bytes:
     return _csv(["review", "sentiment"], rows)
 
 
+def churn(n: int = 3000, seed: int = 5) -> bytes:
+    from datetime import date, timedelta
+    rng = np.random.default_rng(seed)
+    plans = {"basic": 9.99, "plus": 19.99, "pro": 39.99}
+    regions = ["north", "south", "east", "west"]
+    rows = []
+    for _ in range(n):
+        plan = ["basic", "plus", "pro"][rng.choice(3, p=[0.5, 0.35, 0.15])]
+        signup = date(2021, 1, 1) + timedelta(days=int(rng.integers(0, 1400)))
+        months = (date(2024, 11, 1) - signup).days / 30.4
+        calls = int(rng.poisson(1.2 + (plan == "basic")))
+        login = int(min(120, rng.exponential(10)))
+        sat = int(np.clip(round(rng.normal(3.8 - 0.35 * calls, 0.9)), 1, 5))
+        score = -1.6 + 0.45 * calls + 0.045 * login - 0.55 * (sat - 3) - 0.025 * months + (0.5 if plan == "basic" else -0.3 if plan == "pro" else 0)
+        left = rng.random() < 1 / (1 + math.exp(-score))
+        rows.append([f"C{rng.integers(10**5, 10**6)}", signup.isoformat(), plan, plans[plan], calls, login, regions[rng.integers(4)], sat, "yes" if left else "no"])
+    return _csv(["customer_id", "signed_up", "plan", "monthly_fee", "support_calls", "days_since_login", "region", "satisfaction", "left"], rows)
+
+
+def shapes(per_class: int = 200, size: int = 48, seed: int = 9) -> bytes:
+    """A zip with circles/, squares/ and triangles/ folders of small PNG drawings."""
+    import zipfile
+    from PIL import Image, ImageDraw
+    rng = np.random.default_rng(seed)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+        for kind in ("circles", "squares", "triangles"):
+            for i in range(per_class):
+                bg = tuple(int(v) for v in rng.integers(0, 256, 3))
+                fg = tuple(int((v + 128) % 256) for v in bg)
+                img = Image.new("RGB", (size, size), bg)
+                d = ImageDraw.Draw(img)
+                r = rng.uniform(size * 0.18, size * 0.38)
+                cx, cy = rng.uniform(r + 2, size - r - 2, 2)
+                a = rng.uniform(0, 2 * math.pi)
+                if kind == "circles":
+                    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=fg)
+                else:
+                    k = 4 if kind == "squares" else 3
+                    pts = [(cx + r * math.cos(a + 2 * math.pi * j / k), cy + r * math.sin(a + 2 * math.pi * j / k)) for j in range(k)]
+                    d.polygon(pts, fill=fg)
+                arr = np.asarray(img, np.int16) + rng.normal(0, 12, (size, size, 3)).astype(np.int16)
+                out = io.BytesIO()
+                Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8)).save(out, "PNG")
+                z.writestr(f"shapes/{kind}/{kind[:-1]}_{i:03d}.png", out.getvalue())
+    return buf.getvalue()
+
+
 def code() -> bytes:
     root = Path(__file__).resolve().parent.parent
     parts = []
@@ -106,6 +158,10 @@ def make(name: str) -> tuple[str, bytes]:
         return "two_spirals.csv", spirals()
     if name == "reviews":
         return "product_reviews.csv", reviews()
+    if name == "churn":
+        return "customer_churn.csv", churn()
+    if name == "shapes":
+        return "shapes.zip", shapes()
     if name == "code":
         return "ai_room_code.txt", code()
     raise KeyError(name)

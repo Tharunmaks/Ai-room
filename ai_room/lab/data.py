@@ -13,13 +13,14 @@ import re
 import zipfile
 import zlib
 from collections import Counter
+from itertools import chain
 from dataclasses import dataclass
 from datetime import datetime
 
 import numpy as np
 
 MISSING = {"", "na", "n/a", "nan", "null", "none", "?", "-", "--", "missing", "#n/a"}
-TABLE_EXT = {".csv", ".tsv", ".tab", ".json", ".jsonl", ".ndjson"}
+TABLE_EXT = {".csv", ".tsv", ".tab", ".json", ".jsonl", ".ndjson", ".xlsx", ".xlsm"}
 TEXT_EXT = {".txt", ".md", ".markdown", ".rst", ".html", ".htm", ".pdf", ".epub", ".docx", ".py", ".js", ".log"}
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
 TEXT_DIM = 1 << 18          # hashed word features (shared by all text columns); models may fold them smaller
@@ -104,8 +105,13 @@ def sniff_kind(filename: str, raw: bytes) -> str:
 
 
 def read_table(raw: bytes, filename: str) -> tuple[list[str], list[list[str]]]:
-    """Columns and rows (as strings) from CSV/TSV/JSON/JSON-lines, or the first table inside a zip."""
+    """Columns and rows (as strings) from CSV/TSV/JSON/JSON-lines/Excel, or the first table inside a zip."""
     ext = ext_of(filename)
+    if ext in (".xlsx", ".xlsm"):
+        from .xlsx import read_xlsx
+        return read_xlsx(io.BytesIO(raw))
+    if ext == ".xls":
+        raise DataError("Old .xls workbooks are not supported. In Excel, use File → Save As → Excel Workbook (.xlsx) or CSV.")
     if ext == ".zip":
         z = zipfile.ZipFile(io.BytesIO(raw))
         inner = [n for n in z.namelist() if ext_of(n) in TABLE_EXT]
@@ -497,11 +503,10 @@ class Encoder:
                 self.spec.append({"col": c, "j": j, "kind": "category", "cats": cats, "other": other})
                 self._name(c, [f"{c} = {v or '(missing)'}" for v in cats] + ([f"{c} = (other)"] if other else []))
             elif kind == "text":
-                self.spec.append({"col": c, "j": j, "kind": "text", "salt": zlib.crc32(c.encode()) & 0xFFFF})
+                self.spec.append({"col": c, "j": j, "kind": "text", "salt": zlib.crc32(c.encode()) & 0xFFFF, "v": 2})
         if any(s["kind"] == "text" for s in self.spec):
-            df = np.zeros(TEXT_DIM, np.float64)
-            for cols in self._hash_rows(t):
-                df[np.unique(cols)] += 1
+            u = _runs(np.sort(self._text_keys(t)))[0]                 # distinct (row, word) pairs
+            df = np.bincount((u % TEXT_DIM).astype(np.int64), minlength=TEXT_DIM).astype(np.float64)
             self.idf = (np.log((1 + n) / (1 + df)) + 1).astype(np.float32)
         if not self.spec:
             raise DataError("None of the columns can be used to learn from (they are all empty, constant, or IDs).")
@@ -517,6 +522,37 @@ class Encoder:
             return np.full((len(col), len(DATE_PARTS)), np.nan)
         table = {v: _date_parts(to_date(v)) for v in set(col.tolist())}
         return np.array([table[v] for v in col.tolist()], np.float64).reshape(len(col), len(DATE_PARTS))
+
+    def _text_keys(self, t: Table) -> np.ndarray:
+        """row × TEXT_DIM + bucket for every word and word pair of every text column, computed a column at a time:
+        each distinct word is hashed once (CRC-32, remembered), word pairs are mixed from their two words' hashes."""
+        n = t.n
+        keys = []
+        memos = getattr(self, "_memos", None)
+        if memos is None:
+            memos = self._memos = {}
+        for s in self.spec:
+            if s["kind"] != "text":
+                continue
+            salt = s["salt"].to_bytes(2, "little")
+            memo = memos.get(s["col"])
+            if memo is None:
+                memo = memos[s["col"]] = _Memo(salt)
+            toks = [TOKEN.findall(v.lower()) if isinstance(v, str) and not is_missing(v) else [] for v in t.data[s["j"]].tolist()]
+            lens = np.fromiter(map(len, toks), np.int64, count=n)
+            total = int(lens.sum())
+            if not total:
+                continue
+            h = np.fromiter(map(memo.__getitem__, chain.from_iterable(toks)), np.uint64, count=total)
+            rows = np.repeat(np.arange(n, dtype=np.uint64), lens)
+            keys.append(rows * U64(TEXT_DIM) + (h & U64(TEXT_DIM - 1)))
+            has_next = np.ones(total, bool)
+            has_next[np.cumsum(lens)[lens > 0] - 1] = False          # the last word of a row starts no pair
+            i = np.flatnonzero(has_next)
+            with np.errstate(over="ignore"):
+                pair = (h[i] * U64(0x9E3779B97F4A7C15)) ^ (h[i + 1] * U64(0xC2B2AE3D27D4EB4F)) ^ U64(s["salt"] * 0x165667B1)
+            keys.append(rows[i] * U64(TEXT_DIM) + ((pair >> U64(23)) & U64(TEXT_DIM - 1)))
+        return np.concatenate(keys) if keys else np.zeros(0, np.uint64)
 
     def _bucket(self, salt: bytes, tok: str) -> int:
         key = salt + tok.encode()
@@ -572,7 +608,15 @@ class Encoder:
         dense = (np.hstack([b.astype(np.float32, copy=False) for b in blocks]) if blocks else np.zeros((n, 0))).astype(np.float32)
         if self.idf is None:
             return XData(dense)
-        indptr, indices, data = [0], [], []
+        if all(s.get("v") == 2 for s in self.spec if s["kind"] == "text"):
+            u, cnt = _runs(np.sort(self._text_keys(t)))
+            rows, cols = (u // TEXT_DIM).astype(np.int64), (u % TEXT_DIM).astype(np.int64)
+            w = (1 + np.log(cnt)) * self.idf[cols]
+            norm = np.sqrt(np.bincount(rows, weights=w * w, minlength=n))
+            w = (w / np.where(norm[rows] > 0, norm[rows], 1.0)).astype(np.float32)
+            indptr = np.concatenate([[0], np.cumsum(np.bincount(rows, minlength=n))]).astype(np.int64)
+            return XData(dense, indptr, cols, w)
+        indptr, indices, data = [0], [], []                    # models saved before version 2 hash row by row
         for cols in self._hash_rows(t):
             if len(cols):
                 u, cnt = np.unique(cols, return_counts=True)
@@ -605,6 +649,21 @@ class Encoder:
         for i, c in enumerate(self.owner):
             out.setdefault(c, []).append(i)
         return out
+
+
+U64 = np.uint64
+
+
+class _Memo(dict):
+    """word → its CRC-32 (salted per column), computed the first time a word is seen."""
+
+    def __init__(self, salt: bytes):
+        super().__init__()
+        self.salt = salt
+
+    def __missing__(self, tok: str) -> int:
+        h = self[tok] = zlib.crc32(self.salt + tok.encode())
+        return h
 
 
 def _skew(a: np.ndarray) -> float:

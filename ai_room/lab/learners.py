@@ -137,6 +137,8 @@ class OneShot(Learner):
         b = rng.uniform(0, 2 * math.pi, M).astype(F32)
         self.W, self.b = W, b
         p = d + M + 1
+        if len(X) < p:                      # fewer rows than features: solve the same problem through the rows × rows matrix
+            return self._solve_dual(X, T, Xv, yva, task, W, b, lams)
         G = np.zeros((p, p), F32)
         ZtT = np.zeros((p, T.shape[1]), F32)
         for s in range(0, len(X), 8192):
@@ -162,6 +164,30 @@ class OneShot(Learner):
                 best = (sc, coef, lam / ref)
         return best[0], W, b, (Q @ best[1]).astype(F32), best[2]
 
+    def _solve_dual(self, X, T, Xv, yva, task, W, b, lams):
+        """Ridge regression in its dual form: coef = Zᵀ (Z Zᵀ + λI)⁻¹ T. Same answer, cheaper when rows < features."""
+        Z = self._features(X).astype(np.float64)
+        K = Z @ Z.T
+        evals, U = np.linalg.eigh(K)
+        evals = np.maximum(evals, 0)
+        UtT = U.T @ T.astype(np.float64)
+        KvU = (self._features(Xv).astype(np.float64) @ Z.T) @ U
+        ref = float(evals.sum()) / Z.shape[1] or 1.0
+        best = None
+        for lam in ref * np.logspace(-6, 1, lams):
+            inner = UtT / (evals + lam)[:, None]
+            out = (KvU @ inner).astype(F32)
+            if task.kind == "classification":
+                tgt = np.full_like(out, -1.0 / task.classes)
+                tgt[np.arange(len(yva)), yva] += 1
+                sc = float((out.argmax(1) == yva).mean()) - 1e-3 * float(((out - tgt) ** 2).mean())
+            else:
+                sc = quick_score(task, out[:, 0], yva)
+            if best is None or sc > best[0]:
+                best = (sc, inner, lam / ref)
+        coef = (Z.T @ (U @ best[1])).astype(F32)
+        return best[0], W, b, coef, best[2]
+
     def fit(self, Xtr, ytr, Xva, yva, task, deadline, report, stop):
         self.task = task
         X, Xv = Xtr.dense, Xva.dense
@@ -171,7 +197,10 @@ class OneShot(Learner):
         M = int(np.clip(min(n, math.sqrt(2e10 / max(n, 1))), 256, self.max_features))
         M = max(64, min(M, 3000 - d))
         left = max(0.01, deadline - time.perf_counter())
-        while M > 64 and (n * (d + M) ** 2 + 4 * (d + M) ** 3) / 1.2e10 > 0.6 * left:     # arithmetic that fits the time
+        def cost(m):                            # arithmetic for the cheaper of the primal and dual solves, in seconds
+            q = d + m + 1
+            return min(n * q * q + 4 * q ** 3, q * n * n + 4 * n ** 3) / 1.2e10
+        while M > 64 and cost(M) > 0.6 * left:
             M = int(M * 0.7)
         if task.kind == "classification":
             T = np.full((n, task.classes), -1.0 / task.classes, F32)

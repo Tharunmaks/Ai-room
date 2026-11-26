@@ -304,8 +304,8 @@ def test_api_text_model_writes_and_answers(lab):
 
 def test_api_samples_errors_and_safety(lab):
     info = lab.get("/api/lab/info").json()
-    assert [s["key"] for s in info["speeds"]] == ["fast", "balanced", "thorough"] and info["speeds"][0]["label"] == "1 s per MB"
-    assert info["max_bytes"] == 5 * 10**12 and info["max_label"] == "5.0 TB" and info["seconds_per_mb"] == 1.0
+    assert [s["key"] for s in info["speeds"]] == ["fast", "balanced", "thorough"] and info["speeds"][0]["label"] == "10 min per GB"
+    assert info["max_bytes"] == 5 * 10**12 and info["max_label"] == "5.0 TB" and info["seconds_per_mb"] == 0.6
     assert {s["key"] for s in info["samples"]} == set(samples.SAMPLES)
     sp = lab.post("/api/lab/samples/spirals").json()
     assert sp["rows"] == 1200 and sp["target"] == "arm" and sp["sample"] == "spirals"
@@ -341,12 +341,14 @@ def test_cli_trains_predicts_and_lists(tmp_path, capsys):
 
 
 # ------------------------------------------------------------------ size limits and the 1 second per MB budget
-def test_budget_is_one_second_per_megabyte():
-    from ai_room.lab.automl import budget_for
-    assert budget_for("fast", 0) == 1.0 and budget_for("fast", 500_000) == 1.0           # at least 1 s
-    assert budget_for("fast", 7_500_000) == pytest.approx(7.5) and budget_for("quick", 50e6) == pytest.approx(50)
-    assert budget_for("fast", 5e12) == pytest.approx(5_000_000)                           # 5 TB → 5 million seconds at most
-    assert budget_for("balanced", 1e6) == 30 and budget_for("balanced", 100e6) == pytest.approx(100)
+def test_budget_is_ten_minutes_per_gigabyte():
+    from ai_room.lab.automl import RATE_LABEL, budget_for
+    assert RATE_LABEL == "10 min per GB"
+    assert budget_for("fast", 1e9) == pytest.approx(600)                                  # 1 GB → 10 minutes
+    assert budget_for("fast", 0) == 1.0 and budget_for("fast", 1_000_000) == 1.0           # at least 1 s
+    assert budget_for("fast", 7_500_000) == pytest.approx(4.5) and budget_for("quick", 50e6) == pytest.approx(30)
+    assert budget_for("fast", 5e12) == pytest.approx(3_000_000)                           # 5 TB → 50,000 minutes at most
+    assert budget_for("balanced", 1e6) == 30 and budget_for("balanced", 100e6) == pytest.approx(60)
 
 
 def test_upload_streams_to_disk_and_enforces_the_size_cap_and_free_space(lab, monkeypatch):
@@ -369,14 +371,14 @@ def test_upload_streams_to_disk_and_enforces_the_size_cap_and_free_space(lab, mo
     assert up["rows"] == 200 and up["rows_exact"] and up["budget_seconds"] == 1.0
 
 
-def test_a_training_job_finishes_within_one_second_per_megabyte(lab):
+def test_a_training_job_finishes_within_ten_minutes_per_gigabyte(lab):
     rng = np.random.default_rng(3)
     X = rng.normal(size=(40_000, 6))
     y = np.where(X[:, 0] * X[:, 1] + X[:, 2] > 0, "yes", "no")
     body = table_bytes([f"f{i}" for i in range(6)] + ["label"], [[f"{v:.5f}" for v in x] + [t] for x, t in zip(X, y)])
     up = lab.post("/api/lab/datasets?filename=mid.csv", content=body).json()
     budget = up["budget_seconds"]
-    assert budget == pytest.approx(len(body) / 1e6, rel=1e-3) and budget > 2
+    assert budget == pytest.approx(len(body) / 1e6 * 0.6, abs=0.01) and budget > 1.2
     j = wait_job(lab, lab.post("/api/lab/train", json={"dataset": up["id"]}).json()["id"])
     assert j["status"] == "done" and j["budget"] == pytest.approx(budget, abs=0.01)
     assert j["seconds"] <= budget * 1.15 + 0.3, (j["seconds"], budget)
@@ -431,3 +433,154 @@ def test_big_texts_are_sampled_evenly_and_text_learning_meets_its_deadline(tmp_p
     m = CharModel().fit(text, deadline=t0 + 0.4)
     assert time.perf_counter() - t0 < 1.0 and 1 <= m.order <= 10 and m.report["learned_chars"] <= len(text)
     assert abs(m.next_distribution([1, 2]).sum() - 1) < 1e-9
+
+
+# ------------------------------------------------------------------ Excel
+def make_xlsx(rows, date_col=None) -> bytes:
+    """A minimal real .xlsx (shared strings, a date style, booleans, an inline string), written by hand."""
+    import zipfile
+    strings, cells_xml = [], []
+    def col(i):
+        return chr(65 + i)
+    for r, row in enumerate(rows, 1):
+        cs = []
+        for i, v in enumerate(row):
+            ref = f"{col(i)}{r}"
+            if v is None:
+                continue
+            if isinstance(v, bool):
+                cs.append(f'<c r="{ref}" t="b"><v>{int(v)}</v></c>')
+            elif isinstance(v, (int, float)):
+                style = ' s="1"' if date_col is not None and i == date_col and r > 1 else ""
+                cs.append(f'<c r="{ref}"{style}><v>{v}</v></c>')
+            elif v.startswith("inline:"):
+                cs.append(f'<c r="{ref}" t="inlineStr"><is><t>{v[7:]}</t></is></c>')
+            else:
+                if v not in strings:
+                    strings.append(v)
+                cs.append(f'<c r="{ref}" t="s"><v>{strings.index(v)}</v></c>')
+        cells_xml.append(f'<row r="{r}">{"".join(cs)}</row>')
+    ns = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+    rel = 'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("xl/workbook.xml", f'<workbook {ns} {rel}><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>')
+        z.writestr("xl/_rels/workbook.xml.rels", '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                   '<Relationship Id="rId1" Target="worksheets/sheet1.xml" Type="x"/></Relationships>')
+        z.writestr("xl/sharedStrings.xml", f'<sst {ns}>' + "".join(f"<si><t>{t}</t></si>" for t in strings) + "</sst>")
+        z.writestr("xl/styles.xml", f'<styleSheet {ns}><cellXfs><xf numFmtId="0"/><xf numFmtId="14"/></cellXfs></styleSheet>')
+        z.writestr("xl/worksheets/sheet1.xml", f'<worksheet {ns}><dimension ref="A1:D{len(rows)}"/><sheetData>{"".join(cells_xml)}</sheetData></worksheet>')
+    return buf.getvalue()
+
+
+def test_excel_workbooks_are_read_with_dates_booleans_and_gaps():
+    from ai_room.lab.xlsx import Workbook
+    raw = make_xlsx([["name", "joined", "active", "score"], ["Ana", 45000, True, 3.5], ["Bo", 45366, False, None], ["inline:Cy", 45001.5, True, 7]], date_col=1)
+    cols, rows = read_table(raw, "people.xlsx")
+    assert cols == ["name", "joined", "active", "score"]
+    assert rows == [["Ana", "2023-03-15", "TRUE", "3.5"], ["Bo", "2024-03-15", "FALSE", ""], ["Cy", "2023-03-16 12:00:00", "TRUE", "7"]]
+    assert Workbook(io.BytesIO(raw)).dimension_rows() == 4
+    with pytest.raises(DataError, match="xlsx"):
+        read_table(b"not a zip", "old.xls")
+
+
+def test_an_excel_upload_trains_like_a_csv(lab):
+    cols, rows = rings(240)
+    data = [cols] + [[float(r[0]), float(r[1]), float(r[2]), r[3]] for r in rows]
+    up = lab.post("/api/lab/datasets?filename=rings.xlsx", content=make_xlsx(data)).json()
+    assert up["kind"] == "table" and up["rows"] == 240 and up["target"] == "where"
+    j = wait_job(lab, lab.post("/api/lab/train", json={"dataset": up["id"], "speed": "balanced"}).json()["id"])
+    assert j["status"] == "done", j
+    r = lab.post(f"/api/lab/models/{j['model']}/predict_file?filename=new.xlsx", content=make_xlsx([["x", "y"], [0, 0], [0.97, 0.97]]))
+    assert r.status_code == 200 and [row[2] for row in csv.reader(io.StringIO(r.text))][1:] == ["in", "out"]
+
+
+# ------------------------------------------------------------------ pictures
+def shapes_zip(tmp_path, per_class=40):
+    raw = samples.shapes(per_class=per_class, size=40)
+    path = tmp_path / "shapes.zip"
+    path.write_bytes(raw)
+    return path
+
+
+def test_pictures_become_features_and_a_picture_model_learns_them(tmp_path):
+    from ai_room.lab.images import FEATURES, describe_zip, image_table, load_image_zip
+    path = shapes_zip(tmp_path)
+    assert describe_zip(path) == {"classes": {"circles": 40, "squares": 40, "triangles": 40}, "images": 120}
+    t = load_image_zip(path)
+    assert t.n == 120 and len(t.columns) == FEATURES + 1 and t.columns[-1] == "category"
+    m = train_table(t, None, "category", budget=8, image=True)
+    r = m.report
+    assert r["image"]["groups"] == ["shape", "colour layout", "edges", "colour mix"] and r["test"]["accuracy"] > r["baseline_test"]["accuracy"]
+    assert {i["column"] for i in r["importance"]} <= {"shape", "colour layout", "edges", "colour mix"}
+    import zipfile
+    z = zipfile.ZipFile(path)
+    one = z.read(next(n for n in z.namelist() if "circles/" in n))
+    p = m.predict(image_table([one]))[0]
+    assert p["prediction"] in ("circles", "squares", "triangles") and abs(sum(x["p"] for x in p["top"]) - 1) < 1e-5
+
+
+def test_picture_datasets_are_explained_and_bad_uploads_refused(tmp_path):
+    from ai_room.lab.images import describe_zip
+    import zipfile
+    one = tmp_path / "one.zip"
+    with zipfile.ZipFile(one, "w") as z:
+        z.writestr("cats/a.png", b"x")
+        z.writestr("cats/b.png", b"y")
+    with pytest.raises(DataError, match="one folder per category"):
+        describe_zip(one)
+
+
+def test_api_learns_pictures_and_answers_about_a_new_one(lab, tmp_path):
+    sp = lab.post("/api/lab/samples/shapes").json()
+    assert sp["kind"] == "images" and sp["images"] == 600 and sp["classes"] == {"circles": 200, "squares": 200, "triangles": 200}
+    png = lab.get(f"/api/lab/datasets/{sp['id']}/preview.png")
+    assert png.status_code == 200 and png.content[:4] == b"\x89PNG"
+    j = wait_job(lab, lab.post("/api/lab/train", json={"dataset": sp["id"], "speed": "balanced"}).json()["id"])
+    assert j["status"] == "done", j
+    card = lab.get(f"/api/lab/models/{j['model']}").json()
+    assert card["type"] == "image" and card["inputs"] == [] and card["score"]["accuracy"] > 0.5
+    import zipfile
+    z = zipfile.ZipFile(io.BytesIO(samples.shapes(per_class=3, size=40, seed=99)))
+    pic = z.read(z.namelist()[0])
+    r = lab.post(f"/api/lab/models/{j['model']}/predict_image", content=pic).json()
+    assert r["prediction"]["prediction"] in ("circles", "squares", "triangles")
+    assert lab.post(f"/api/lab/models/{j['model']}/predict_image", content=b"not a picture").status_code == 400
+    out = lab.post(f"/api/lab/models/{j['model']}/predict_file?filename=batch.zip", content=samples.shapes(per_class=2, size=40, seed=7))
+    rows = list(csv.reader(io.StringIO(out.text)))
+    assert out.status_code == 200 and rows[0] == ["file", "predicted category", "confidence"] and len(rows) == 7
+    assert lab.post("/api/lab/datasets?filename=cat.jpg", content=pic).status_code == 400   # one picture: explain zips
+
+
+# ------------------------------------------------------------------ friendlier model handling
+def test_models_can_be_renamed_downloaded_and_imported(lab):
+    cols, rows = rings(200)
+    up = lab.post("/api/lab/datasets?filename=rings.tsv", content=table_bytes(cols, rows).replace(b",", b"\t")).json()
+    assert up["kind"] == "table" and up["columns"] == cols                      # pasted from a spreadsheet: tab-separated
+    j = wait_job(lab, lab.post("/api/lab/train", json={"dataset": up["id"]}).json()["id"])
+    mid = j["model"]
+    assert lab.patch(f"/api/lab/models/{mid}", json={"name": "  Inside the ring  "}).json()["name"] == "Inside the ring"
+    assert lab.patch(f"/api/lab/models/{mid}", json={"name": "   "}).status_code == 400
+    z = lab.get(f"/api/lab/models/{mid}/download")
+    assert z.status_code == 200 and "Inside_the_ring" in z.headers["content-disposition"]
+    imp = lab.post("/api/lab/models/import", content=z.content).json()
+    assert imp["id"] != mid and imp["name"] == "Inside the ring" and imp["curve"]
+    a = lab.post(f"/api/lab/models/{mid}/predict", json={"rows": [{"x": 0.1, "y": 0}]}).json()
+    b = lab.post(f"/api/lab/models/{imp['id']}/predict", json={"rows": [{"x": 0.1, "y": 0}]}).json()
+    assert a["predictions"] == b["predictions"]
+    assert lab.post("/api/lab/models/import", content=b"junk").status_code == 400
+    assert len(lab.get("/api/lab/models").json()) == 2
+
+
+def test_text_models_saved_before_column_hashing_still_predict(tmp_path):
+    fn, raw = samples.make("reviews")
+    cols, rows = read_table(raw, fn)
+    m = train_table(cols, rows[:400], "sentiment", budget=3)
+    m.save(tmp_path / "v2")
+    meta = json.loads((tmp_path / "v2" / "model.json").read_text())
+    for s in meta["encoder"]["spec"]:
+        s.pop("v", None)                                     # what a model from the previous version looks like
+    (tmp_path / "v2" / "model.json").write_text(json.dumps(meta))
+    old = Trained.load(tmp_path / "v2")
+    p = old.predict([{"review": "The kettle is great. Five stars."}])[0]
+    assert p["prediction"] in ("positive", "negative") and 0 < p["confidence"] <= 1

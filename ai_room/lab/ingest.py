@@ -116,6 +116,11 @@ def inspect_table(path: Path, filename: str) -> tuple[list[str], list[list[str]]
     """(columns, rows from the head, total rows, exact?) without reading a big file entirely."""
     size = path.stat().st_size
     ext = ext_of(filename)
+    if ext in (".xlsx", ".xlsm") and size > 64 << 20:          # big workbook: read the first rows, ask the sheet how many it has
+        from .xlsx import Workbook, read_xlsx
+        cols, rows = read_xlsx(path, limit=2000)
+        total = Workbook(path).dimension_rows()
+        return cols, rows, (total - 1 if total else len(rows)), False
     if ext == ".zip" or ext == ".json" or size <= 64 << 20:
         if ext == ".json" and size > 2 << 30:
             raise DataError("JSON arrays bigger than 2 GB cannot be read in pieces. Save the data as JSON-lines (one record per line) or CSV.")
@@ -137,6 +142,10 @@ def load_table(path: Path, filename: str, limit_cells: int | None = None, seed: 
     path = Path(path)
     size = path.stat().st_size
     ext = ext_of(filename)
+    if ext in (".xlsx", ".xlsm"):
+        from .xlsx import read_xlsx
+        cols, rows = read_xlsx(path)
+        return _cap(Table.from_rows(cols, rows), limit_cells, seed, say)
     if ext in (".json", ".zip") or size <= 8 << 20:
         if ext == ".json" and size > 2 << 30:
             raise DataError("JSON arrays bigger than 2 GB cannot be read in pieces. Save the data as JSON-lines (one record per line) or CSV.")
