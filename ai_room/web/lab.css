@@ -132,3 +132,6 @@ button.lab-col { cursor: pointer; }
 .lab-welcome h2 { font-size: clamp(24px, 4vw, 36px); letter-spacing: -.035em; margin: 6px 0 10px; }
 .lab-welcome > p { max-width: 60ch; margin: 0 auto; }
 .lab-hero-ic { font-size: 56px; animation: pop .8s; }
+
+.lab-up { display: flex; flex-direction: column; gap: 5px; width: 100%; margin-top: 8px; }
+.lab-up small { color: var(--muted); font-variant-numeric: tabular-nums; }

@@ -8,7 +8,7 @@ Object.assign(ICONS, {
 });
 const LAB = {
   info: null, datasets: [], models: [], jobs: [], sel: null, ds: null, model: null, job: null, timer: null,
-  speed: store.get("lab.speed", "balanced"), ignore: new Set(), target: null, task: "auto", out: null,
+  speed: store.get("lab.speed", "fast"), ignore: new Set(), target: null, task: "auto", out: null,
 };
 try { LAB.sel = JSON.parse(store.get("lab.sel", "null")); } catch (e) { LAB.sel = null; }
 const LEARNERS = {
@@ -16,7 +16,9 @@ const LEARNERS = {
   boost: { label: "Boosted trees", s: 3 }, mlp: { label: "Neural network", s: 4 },
 };
 const KIND_LABEL = { number: "number", category: "category", text: "text", date: "date", id: "ignored · ID", constant: "ignored · constant", empty: "ignored · empty" };
-const fmtBytes = (b) => (b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : b >= 1e3 ? `${Math.round(b / 1e3)} KB` : `${b} B`);
+const fmtBytes = (b) => (b >= 1e12 ? `${(b / 1e12).toFixed(2)} TB` : b >= 1e9 ? `${(b / 1e9).toFixed(2)} GB` : b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : b >= 1e3 ? `${Math.round(b / 1e3)} KB` : `${b} B`);
+const approx = (n, exact) => `${exact === false ? "≈ " : ""}${(n || 0).toLocaleString()}`;
+const budgetOf = (bytes, speed) => { const sp = LAB.info.speeds.find((x) => x.key === speed) || LAB.info.speeds[0]; const perMb = Math.max(1, (bytes / 1e6) * LAB.info.seconds_per_mb); return sp.key === "fast" ? perMb : Math.max(sp.seconds, perMb); };
 const fmtSec = (s) => (s == null ? "—" : s < 0.01 ? "<0.01 s" : s < 10 ? `${s.toFixed(2)} s` : s < 120 ? `${s.toFixed(1)} s` : `${Math.round(s / 60)} min`);
 const fmtNum = (x) => (x == null || !isFinite(x) ? "—" : Math.abs(x) >= 1000 ? Math.round(x).toLocaleString() : Math.abs(x) >= 10 ? x.toFixed(1) : x.toPrecision(3));
 const scoreOf = (task, m) => (!m ? null : task === "classification" ? m.accuracy : m.r2);
@@ -40,14 +42,15 @@ async function renderLab() {
         <label class="lab-drop" id="labDrop" tabindex="0">
           <input type="file" id="labFile" hidden accept=".csv,.tsv,.tab,.json,.jsonl,.ndjson,.txt,.md,.markdown,.rst,.html,.htm,.pdf,.docx,.epub,.zip,.py,.js,.log">
           <span class="lab-drop-ic">${icon("upload")}</span><b>Drop a file here or click to upload</b>
-          <span class="small muted">Tables: CSV, TSV, JSON · Text: TXT, MD, HTML, PDF, DOCX, EPUB · ZIP — up to ${LAB.info.max_mb} MB</span>
+          <span class="small muted">Tables: CSV, TSV, JSON · Text: TXT, MD, HTML, PDF, DOCX, EPUB · ZIP — up to ${esc(LAB.info.max_label)} per file (${esc(LAB.info.disk_free_label)} free on this disk)</span>
+          <span class="lab-up" id="labUp" hidden><span class="bar"><span id="labUpBar" style="width:0%"></span></span><small id="labUpTxt"></small></span>
         </label>
         <div class="lab-samples"><span class="small muted">No data at hand? Try one:</span><div class="row wrap gap-s" id="labSamples"></div></div>
         <div id="labLists"></div>
       </aside>
       <section class="lab-main" id="labMain" aria-live="polite"></section>
     </div>`;
-  $("#labStats").innerHTML = `<span class="chip">${icon("brain")} ${plural(LAB.models.length, "model")}</span><span class="chip">${icon("table")} ${plural(LAB.datasets.length, "dataset")}</span><span class="chip" title="Training uses all CPU cores, no GPU needed">⚙️ ${LAB.info.cpus} CPU cores</span>`;
+  paintStats();
   $("#labSamples").innerHTML = LAB.info.samples.map((s) => `<button class="chip" data-act="lab-sample" data-arg="${s.key}" title="${esc(s.about)}">${s.icon} ${esc(s.title)}</button>`).join("");
   bindDrop();
   paintLists();
@@ -55,6 +58,10 @@ async function renderLab() {
   if (running) LAB.sel = { kind: "job", id: running.id };
   if (!LAB.sel || !valid(LAB.sel)) LAB.sel = LAB.models[0] ? { kind: "model", id: LAB.models[0].id } : LAB.datasets[0] ? { kind: "dataset", id: LAB.datasets[0].id } : null;
   openSel();
+}
+function paintStats() {
+  const el = $("#labStats"); if (!el) return;
+  el.innerHTML = `<span class="chip">${icon("brain")} ${plural(LAB.models.length, "model")}</span><span class="chip">${icon("table")} ${plural(LAB.datasets.length, "dataset")}</span><span class="chip" title="Training uses all CPU cores, no GPU needed">⚙️ ${LAB.info.cpus} CPU cores</span><span class="chip on" title="The fast setting gives the whole job 1 second per megabyte of data (at least 1 second)">⚡ 1 s per MB</span>`;
 }
 function valid(sel) {
   if (sel.kind === "model") return LAB.models.some((m) => m.id === sel.id);
@@ -72,23 +79,36 @@ function bindDrop() {
 }
 
 async function uploadData(f) {
-  if (f.size > LAB.info.max_mb * 1024 * 1024) { toast(`That file is larger than ${LAB.info.max_mb} MB.`, "err"); return; }
-  const drop = $("#labDrop");
-  drop.classList.add("busy"); $("b", drop).textContent = `Reading ${f.name}…`;
+  if (f.size > LAB.info.max_bytes) { toast(`That file is ${fmtBytes(f.size)} — more than the ${LAB.info.max_label} limit.`, "err"); return; }
+  if (f.size > LAB.info.disk_free) { toast(`Not enough disk space: ${fmtBytes(f.size)} needed, ${LAB.info.disk_free_label} free.`, "err"); return; }
+  const drop = $("#labDrop"), up = $("#labUp");
+  drop.classList.add("busy"); $("b", drop).textContent = `Uploading ${f.name}…`; up.hidden = false;
+  const t0 = performance.now();
   try {
-    const r = await fetch(`/api/lab/datasets?filename=${encodeURIComponent(f.name)}`, { method: "POST", body: f });
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(typeof data.detail === "string" ? data.detail : "Upload failed");
+    const data = await new Promise((resolve, reject) => {
+      const x = new XMLHttpRequest();
+      x.open("POST", `/api/lab/datasets?filename=${encodeURIComponent(f.name)}`);
+      x.upload.onprogress = (e) => {
+        if (!e.lengthComputable) return;
+        const secs = (performance.now() - t0) / 1000, rate = e.loaded / Math.max(secs, 1e-3);
+        $("#labUpBar").style.width = `${(100 * e.loaded / e.total).toFixed(1)}%`;
+        $("#labUpTxt").textContent = `${fmtBytes(e.loaded)} of ${fmtBytes(e.total)} · ${fmtBytes(rate)}/s` + (e.loaded < e.total ? ` · ${fmtSec((e.total - e.loaded) / rate)} left` : " · reading it…");
+      };
+      x.onload = () => { let d = {}; try { d = JSON.parse(x.responseText); } catch (err) { /* not JSON */ } x.status < 300 ? resolve(d) : reject(new Error(typeof d.detail === "string" ? d.detail : `Upload failed (${x.status})`)); };
+      x.onerror = () => reject(new Error("Upload failed: the connection was lost."));
+      x.send(f);
+    });
     LAB.datasets = await api("/api/lab/datasets");
     LAB.sel = { kind: "dataset", id: data.id }; LAB.ds = data;
     paintLists(); openSel();
-    toast(`${f.name}: ${data.kind === "text" ? `${data.chars.toLocaleString()} characters` : `${data.rows.toLocaleString()} rows`}`, "ok");
+    toast(`${f.name}: ${data.kind === "text" ? `${approx(data.chars, data.chars_exact)} characters` : `${approx(data.rows, data.rows_exact)} rows`}`, "ok");
   } catch (e) { toast(e.message, "err"); } finally {
-    drop.classList.remove("busy"); $("b", drop).textContent = "Drop a file here or click to upload";
+    drop.classList.remove("busy"); $("b", drop).textContent = "Drop a file here or click to upload"; up.hidden = true;
   }
 }
 
 function paintLists() {
+  paintStats();
   const box = $("#labLists"); if (!box) return;
   const on = (kind, id) => (LAB.sel && LAB.sel.kind === kind && LAB.sel.id === id ? " on" : "");
   const live = LAB.jobs.filter((j) => j.status === "running" || j.status === "queued");
@@ -101,7 +121,7 @@ function paintLists() {
     <h4 class="lab-h">Datasets</h4>
     ${LAB.datasets.map((d) => `<button class="lab-item${on("dataset", d.id)}" data-act="lab-open" data-arg="dataset:${d.id}">
         <span class="lab-ic">${d.kind === "text" ? "📄" : "📊"}</span>
-        <span class="grow"><b>${esc(d.name)}</b><small>${d.kind === "text" ? `${(d.chars || 0).toLocaleString()} characters` : `${(d.rows || 0).toLocaleString()} rows · ${(d.columns || []).length} columns`}</small></span></button>`).join("") || `<p class="small muted">Upload a file or try a sample.</p>`}`;
+        <span class="grow"><b>${esc(d.name)}</b><small>${d.kind === "text" ? `${approx(d.chars, d.chars_exact)} characters` : `${approx(d.rows, d.rows_exact)} rows · ${(d.columns || []).length} columns`} · ${fmtBytes(d.bytes || 0)}</small></span></button>`).join("") || `<p class="small muted">Upload a file or try a sample.</p>`}`;
 }
 
 async function openSel() {
@@ -134,10 +154,10 @@ function paintDataset() {
   const d = LAB.ds, main = $("#labMain");
   if (d.kind === "text") {
     main.innerHTML = `<div class="card lab-panel">
-      ${panelHead("📄", d.name, `${d.chars.toLocaleString()} characters · ${plural(d.documents, "document")} · ${fmtBytes(d.bytes)}`, `dataset:${d.id}`)}
+      ${panelHead("📄", d.name, `${approx(d.chars, d.chars_exact)} ${d.chars_exact === false ? "bytes of" : "characters ·"} ${d.chars_exact === false ? "text" : plural(d.documents, "document")} · ${fmtBytes(d.bytes)}`, `dataset:${d.id}`)}
       <p class="muted small">A text model counts which character follows every short stretch of text (1 to 10 characters), in one pass. It then writes in the style of your text, and you can search it by asking questions.</p>
       <pre class="lab-pre">${esc(d.preview_text)}${d.chars > 1500 ? "\n…" : ""}</pre>
-      <div class="row wrap" style="margin-top:16px"><button class="btn primary big" data-act="lab-train">${icon("play")} Learn this text</button><span class="small muted">Usually takes a few seconds per megabyte.</span></div>
+      <div class="row wrap" style="margin-top:16px"><button class="btn primary big" data-act="lab-train">${icon("play")} Learn this text</button><span class="small muted">Time allowed: <b>${fmtSec(budgetOf(d.bytes, "fast"))}</b> — 1 second per MB. Texts bigger than ${(32).toLocaleString()} million characters are learned from evenly spaced samples.</span></div>
     </div>`;
     return;
   }
@@ -145,7 +165,7 @@ function paintDataset() {
   if (!LAB.target || !d.columns.includes(LAB.target) || LAB.dsId !== d.id) { LAB.target = d.target; LAB.ignore = new Set(); LAB.task = "auto"; LAB.dsId = d.id; }
   const tp = d.profile.find((p) => p.name === LAB.target);
   main.innerHTML = `<div class="card lab-panel">
-    ${panelHead("📊", d.name, `${d.rows.toLocaleString()} rows · ${d.columns.length} columns · ${fmtBytes(d.bytes)}`, `dataset:${d.id}`)}
+    ${panelHead("📊", d.name, `${approx(d.rows, d.rows_exact)} rows · ${d.columns.length} columns · ${fmtBytes(d.bytes)}`, `dataset:${d.id}`)}
     <div class="grid g-2 lab-setup">
       <label class="field"><span>What should it learn to predict?</span><select id="labTarget">${usable.filter((p) => p.kind !== "text").map((p) => `<option value="${esc(p.name)}"${p.name === LAB.target ? " selected" : ""}>${esc(p.name)}</option>`).join("")}</select></label>
       <div class="field"><span>The answer is…</span><div class="seg" id="labTask">${[["auto", "Auto"], ["classification", "A category"], ["regression", "A number"]].map(([k, l]) => `<button type="button" class="${LAB.task === k ? "on" : ""}" data-act="lab-task" data-arg="${k}">${l}</button>`).join("")}</div>
@@ -156,10 +176,10 @@ function paintDataset() {
     <div class="lab-table-wrap" tabindex="0" aria-label="First rows of the data"><table class="lab-table"><thead><tr>${d.columns.map((c) => `<th class="${c === LAB.target ? "tgt" : ""}">${esc(c)}</th>`).join("")}</tr></thead>
       <tbody>${d.preview.slice(0, 8).map((r) => `<tr>${r.map((v, i) => `<td class="${d.columns[i] === LAB.target ? "tgt" : ""}">${esc(v.length > 60 ? v.slice(0, 58) + "…" : v)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>
     <div class="lab-go">
-      <div class="field"><span>How long may it learn?</span><div class="seg" id="labSpeed">${Object.entries(LAB.info.speeds).map(([k, s]) => `<button type="button" class="${LAB.speed === k ? "on" : ""}" data-act="lab-speed" data-arg="${k}">${{ quick: "⚡ Quick", balanced: "⚖️ Balanced", thorough: "🔬 Thorough" }[k]} <small>≈${s < 60 ? `${s} s` : `${s / 60} min`}</small></button>`).join("")}</div></div>
+      <div class="field"><span>How long may it learn? <b id="labBudget">${fmtSec(budgetOf(d.bytes, LAB.speed))}</b> for this file</span><div class="seg" id="labSpeed">${LAB.info.speeds.map((sp) => `<button type="button" class="${LAB.speed === sp.key ? "on" : ""}" data-act="lab-speed" data-arg="${sp.key}">${{ fast: "⚡ Fast", balanced: "⚖️ Balanced", thorough: "🔬 Thorough" }[sp.key]} <small>${esc(sp.label)}</small></button>`).join("")}</div></div>
       <button class="btn primary big" data-act="lab-train">${icon("play")} Train from scratch</button>
     </div>
-    <p class="small muted" style="margin:12px 0 0">It splits the rows first: 70% to learn from, 15% to check progress, and 15% locked away for the final, honest test.${d.rows < 200 ? " With so few rows, scores will jump around — more data helps more than anything." : ""}</p>
+    <p class="small muted" style="margin:12px 0 0">It splits the rows first: 70% to learn from, 15% to check progress, and 15% locked away for the final, honest test. Fast gives the whole job — reading, learning, testing, saving — 1 second per MB (at least 1 s).${d.rows < 200 ? " With so few rows, scores will jump around — more data helps more than anything." : ""}${d.rows_exact === false ? " If the rows do not fit in memory, it learns from a random sample of them." : ""}</p>
   </div>`;
   $("#labTarget").onchange = (e) => { LAB.target = e.target.value; LAB.ignore.delete(LAB.target); paintDataset(); };
 }
@@ -198,7 +218,6 @@ async function pollJob() {
     toast(`Learned in ${fmtSec(m?.seconds)}${m && m.type === "table" ? ` — ${scoreName(m.task)} ${fmtScore(m.task, scoreOf(m.task, m.score))} on rows it never saw` : ""}`, "ok");
     confetti(0.5);
     LAB.sel = { kind: "model", id: j.model }; openSel();
-    $("#labStats") && ($("#labStats").firstElementChild.innerHTML = `${icon("brain")} ${plural(LAB.models.length, "model")}`);
   } else if (j.status === "error") { paintJob(false); paintLists(); }
   else { paintLists(); }
 }
@@ -213,6 +232,7 @@ function raceState(events) {
     else if (e.type === "progress" && L[e.learner]) { const l = L[e.learner]; if (e.val != null) { l.val = e.val; l.pts.push([e.at, e.val]); } l.frac = Math.max(l.frac, Math.min(1, (e.t || 0) / Math.max(l.budget, 0.1)), e.total ? e.step / e.total : 0); l.note = e.note; l.t = e.t; }
     else if (e.type === "learner_done" && L[e.learner]) { const l = L[e.learner]; l.status = "done"; l.frac = 1; l.valid = e.valid; l.test = e.test; l.seconds = e.seconds; l.val = scoreOf(e.valid.accuracy != null ? "classification" : "regression", e.valid); l.pts.push([e.at, l.val]); }
     else if (e.type === "learner_failed" && L[e.learner]) { L[e.learner].status = "failed"; L[e.learner].error = e.error; }
+    else if (e.type === "learner_skipped" && L[e.learner]) { L[e.learner].status = "failed"; L[e.learner].error = "skipped: the time was used up"; }
   }
   return { L, order, stages };
 }
@@ -231,7 +251,7 @@ function paintJob(full) {
       <div id="labRace"></div><div id="labChart"></div><div id="labJobErr"></div></div>`;
   }
   $("#labJobTitle").innerHTML = `${live ? '<span class="pulse"></span> ' : ""}${j.status === "queued" ? "Waiting for the trainer…" : live ? `Learning ${esc(j.dataset_name)}…` : j.status === "done" ? `Learned ${esc(j.dataset_name)}` : j.status === "stopped" ? "Stopped" : "Something went wrong"}`;
-  $("#labJobSub").textContent = `${fmtSec(elapsed)}${j.kind !== "text" ? ` · speed: ${j.speed}` : ""}`;
+  $("#labJobSub").textContent = `${fmtSec(elapsed)}${j.budget ? ` of ${fmtSec(j.budget)} allowed (${j.speed === "fast" ? "1 s per MB" : j.speed})` : ""}`;
   $("#labStop").hidden = !live;
   $("#labStages").innerHTML = stages.slice(-4).map((s, i, a) => `<li class="${i === a.length - 1 && live ? "now" : ""}">${esc(s)}</li>`).join("");
   if (j.kind !== "text" && order.length) {
@@ -260,9 +280,10 @@ function paintModel() {
       <div class="lab-tiles">
         ${tile(task === "classification" ? "Accuracy on unseen rows" : "R² on unseen rows", fmtScore(task, test), task === "classification" ? `${Math.round(test * r.split.test)} of ${r.split.test} rows right` : `typical error ±${fmtNum(r.test.mae)}`, true)}
         ${tile("Without learning", fmtScore(task, base), task === "classification" ? "always the most common answer" : "always the average")}
-        ${tile("Learned in", fmtSec(r.seconds_total), `from ${r.split.train.toLocaleString()} rows`)}
+        ${tile("Learned in", fmtSec(m.seconds), m.budget ? `of ${fmtSec(m.budget)} allowed · ${r.split.train.toLocaleString()} rows` : `from ${r.split.train.toLocaleString()} rows`)}
         ${tile("First model ready", fmtSec(r.first_model_seconds), "the one-shot net needs no epochs")}
       </div>
+      ${r.sampled ? `<p class="small muted" style="margin:10px 0 0">The file has ${approx(r.file_rows, r.rows_exact)} rows — more than fit in memory — so it learned from a random sample of ${r.rows.toLocaleString()}.</p>` : ""}
       ${r.ignored?.length ? `<p class="small muted" style="margin:10px 0 0">Not used: ${r.ignored.map((i) => `<b>${esc(i.name)}</b> (${esc(i.why)})`).join(", ")}.</p>` : ""}
     </div>
     <div class="grid g-2 lab-grid">
@@ -348,7 +369,7 @@ function paintTextModel() {
       <div class="lab-tiles">
         ${tile("Bits per character", r.valid_bits_per_char.toFixed(2), "on the last tenth, held back", true)}
         ${tile("Random guessing", r.random_bits_per_char.toFixed(2), "bits per character")}
-        ${tile("Learned in", fmtSec(r.seconds), `${Math.round(r.chars_per_second).toLocaleString()} characters a second`)}
+        ${tile("Learned in", fmtSec(m.seconds || r.seconds), m.budget ? `of ${fmtSec(m.budget)} allowed · ${(r.learned_chars || r.chars).toLocaleString()} characters` : `${Math.round(r.chars_per_second).toLocaleString()} characters a second`)}
         ${tile("Looks back", `${r.order}`, "characters — the context that predicted best")}
       </div>
       <p class="small muted" style="margin:10px 0 0">Lower bits per character means better prediction: letter frequencies alone need ${r.letter_frequency_bits_per_char.toFixed(2)}. This model copies style, spelling and layout; it does not understand or reason, and knows nothing beyond your text.</p>
@@ -511,7 +532,7 @@ Object.assign(ACTIONS, {
   },
   "lab-open"(arg) { const [kind, id] = arg.split(":"); LAB.sel = { kind, id }; openSel(); if (innerWidth < 1000) $("#labMain")?.scrollIntoView({ behavior: "smooth" }); },
   "lab-task"(k) { LAB.task = k; paintDataset(); },
-  "lab-speed"(k) { LAB.speed = k; store.set("lab.speed", k); $$("#labSpeed button").forEach((b) => b.classList.toggle("on", b.dataset.arg === k)); },
+  "lab-speed"(k) { LAB.speed = k; store.set("lab.speed", k); $$("#labSpeed button").forEach((b) => b.classList.toggle("on", b.dataset.arg === k)); if ($("#labBudget") && LAB.ds) $("#labBudget").textContent = fmtSec(budgetOf(LAB.ds.bytes, k)); },
   "lab-col"(name) { LAB.ignore.has(name) ? LAB.ignore.delete(name) : LAB.ignore.add(name); $("#labCols").innerHTML = colChips(LAB.ds); },
   async "lab-train"() {
     const d = LAB.ds;

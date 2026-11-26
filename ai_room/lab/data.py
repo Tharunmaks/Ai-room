@@ -216,37 +216,125 @@ def read_text(raw: bytes, filename: str) -> list[tuple[str, str]]:
     return [(title, text)]
 
 
+# ------------------------------------------------------------------ tables as columns
+class Table:
+    """Columns of a table: each a NumPy array of strings (dtype object) or, for clean numbers, float64."""
+
+    def __init__(self, columns: list[str], data: list[np.ndarray], total_rows: int | None = None, exact: bool = True, sampled: bool = False):
+        self.columns, self.data = list(columns), data
+        self.total_rows, self.exact, self.sampled = (len(data[0]) if data else 0) if total_rows is None else total_rows, exact, sampled
+
+    @property
+    def n(self) -> int:
+        return len(self.data[0]) if self.data else 0
+
+    @classmethod
+    def from_rows(cls, columns: list[str], rows: list) -> "Table":
+        w = len(columns)
+        clean = all(isinstance(r, list) and len(r) == w for r in rows[:1000]) and all(len(r) == w for r in rows)
+        if not clean:
+            rows = [(["" if v is None else str(v) for v in r] + [""] * w)[:w] for r in rows]
+        data = []
+        for c in (zip(*rows) if rows else [()] * w):
+            a = np.empty(len(c), dtype=object)
+            a[:] = c
+            data.append(a)
+        return cls(columns, data, len(rows))
+
+    def col(self, name: str) -> np.ndarray:
+        return self.data[self.columns.index(name)]
+
+    def take(self, idx) -> "Table":
+        return Table(self.columns, [c[idx] for c in self.data], self.total_rows, self.exact, self.sampled)
+
+    def rows(self, limit: int | None = None) -> list[list[str]]:
+        k = self.n if limit is None else min(limit, self.n)
+        return [[cell_str(c[i]) for c in self.data] for i in range(k)]
+
+
+def cell_str(v) -> str:
+    if isinstance(v, (float, np.floating)):
+        if np.isnan(v):
+            return ""
+        return str(int(v)) if float(v).is_integer() and abs(v) < 1e15 else repr(float(v))
+    return "" if v is None else str(v)
+
+
+def _mapped(col: np.ndarray, fn, dtype) -> np.ndarray:
+    """fn applied to every value, computed once per distinct value (columns repeat values a lot)."""
+    table = {v: fn(v) for v in set(col.tolist())}
+    return np.fromiter(map(table.__getitem__, col.tolist()), dtype=dtype, count=len(col))
+
+
+def to_floats(col: np.ndarray) -> np.ndarray:
+    """Numbers from a column; missing or unreadable values become NaN."""
+    if col.dtype != object:
+        out = col.astype(np.float64)
+    else:
+        try:
+            out = col.astype(np.float64)                       # clean numbers: parsed in C
+        except (ValueError, TypeError):
+            out = _mapped(col, lambda v: np.nan if is_missing(v) else (to_float(v) if to_float(v) is not None else np.nan), np.float64)
+    out[~np.isfinite(out)] = np.nan
+    return out
+
+
+def missing_mask(col: np.ndarray) -> np.ndarray:
+    if col.dtype != object:
+        return np.isnan(col)
+    return _mapped(col, is_missing, bool)
+
+
+def _runs(s: np.ndarray):
+    if not len(s):
+        return s, np.zeros(0, np.int64)
+    starts = np.concatenate([[0], np.flatnonzero(s[1:] != s[:-1]) + 1])
+    return s[starts], np.diff(np.append(starts, len(s)))
+
+
 # ------------------------------------------------------------------ what is in each column
 ID_NAME = re.compile(r"(^|[\s_\-.])(id|uuid|guid|index|key)$|^unnamed: ?0$|^(row ?)?(no|num|number|#)$", re.I)
 
 
-def profile(columns: list[str], rows: list[list[str]], sample: int = 4000) -> list[dict]:
-    """For each column: its kind (number, category, text, date) or why it is ignored, and a few facts."""
+def profile(table, rows: list[list[str]] | None = None, sample: int = 4000) -> list[dict]:
+    """For each column: its kind (number, category, text, date) or why it is ignored, and a few facts.
+
+    Takes a Table, or (columns, rows). Kinds are judged on up to `sample` values per column; counts of distinct
+    values use the whole column."""
+    if rows is not None or not isinstance(table, Table):
+        table = Table.from_rows(table, rows or [])
     out = []
-    n = len(rows)
+    n = table.n
     step = max(1, n // sample)
-    for j, name in enumerate(columns):
-        vals = [r[j] for r in rows[::step]]
+    for j, name in enumerate(table.columns):
+        col = table.data[j]
+        if col.dtype != object:
+            out.append(_profile_numeric(name, col))
+            continue
+        vals = col[::step].tolist()
         present = [v for v in vals if not is_missing(v)]
         info = {"name": name, "missing": round(1 - len(present) / max(1, len(vals)), 4)}
         if not present:
             out.append({**info, "kind": "empty", "why": "every value is missing"})
             continue
         uniq = Counter(v.strip() for v in present)
-        info["unique"] = len(uniq) if step == 1 else len(Counter(r[j].strip() for r in rows if not is_missing(r[j])))
+        if step == 1:
+            info["unique"] = len(uniq)
+        else:
+            whole = set(col.tolist())
+            info["unique"] = len(whole) - ("" in whole)
         info["examples"] = [v for v, _ in uniq.most_common(5)]
-        if len(uniq) == 1 and info["unique"] == 1:
+        if len(uniq) == 1 and info["unique"] <= 1:
             out.append({**info, "kind": "constant", "why": "has the same value in every row"})
             continue
         nums = [to_float(v) for v in present]
         good = [f for f in nums if f is not None]
         if len(good) >= 0.97 * len(present):
             ints = all(f == int(f) for f in good)
-            kind = "number"
             if ID_NAME.search(name) and ints and info["unique"] >= 0.95 * (n - info["missing"] * n):
                 out.append({**info, "kind": "id", "why": "looks like a row number or ID"})
                 continue
-            out.append({**info, "kind": kind, "min": min(good), "max": max(good), "mean": sum(good) / len(good), "integers": ints})
+            out.append({**info, "kind": "number", "min": min(good), "max": max(good), "mean": sum(good) / len(good), "integers": ints})
             continue
         if sum(to_date(v) is not None for v in present[:500]) >= 0.9 * min(500, len(present)):
             out.append({**info, "kind": "date"})
@@ -261,6 +349,22 @@ def profile(columns: list[str], rows: list[list[str]], sample: int = 4000) -> li
         else:
             out.append({**info, "kind": "category"})
     return out
+
+
+def _profile_numeric(name: str, col: np.ndarray) -> dict:
+    ok = col[~np.isnan(col)]
+    info = {"name": name, "missing": round(1 - len(ok) / max(1, len(col)), 4)}
+    if not len(ok):
+        return {**info, "kind": "empty", "why": "every value is missing"}
+    u, _ = _runs(np.sort(ok))
+    info["unique"] = int(len(u))
+    info["examples"] = [cell_str(v) for v in u[:5]]
+    if len(u) == 1:
+        return {**info, "kind": "constant", "why": "has the same value in every row"}
+    ints = bool(np.all(ok == np.round(ok)))
+    if ID_NAME.search(name) and ints and len(u) >= 0.95 * len(ok):
+        return {**info, "kind": "id", "why": "looks like a row number or ID"}
+    return {**info, "kind": "number", "min": float(ok.min()), "max": float(ok.max()), "mean": float(ok.mean()), "integers": ints}
 
 
 def pick_target(prof: list[dict]) -> str | None:
@@ -335,7 +439,8 @@ def text_tokens(s: str) -> list[str]:
 
 
 class Encoder:
-    """Turns rows (lists of strings) into XData. Fitted on training rows only."""
+    """Turns table columns into XData. Fitted on training rows only. Works column by column; every distinct
+    value is converted once, which is what makes millions of rows fast."""
 
     def __init__(self, columns: list[str], kinds: dict[str, str]):
         self.columns = columns
@@ -344,40 +449,46 @@ class Encoder:
         self.idf: np.ndarray | None = None
         self.names: list[str] = []      # name of each dense feature
         self.owner: list[str] = []      # which input column each dense feature came from
+        self._memo: dict[str, int] = {}
 
     # -- fitting
-    def fit(self, rows: list[list[str]]) -> "Encoder":
+    def fit(self, rows) -> "Encoder":
+        t = rows if isinstance(rows, Table) else Table.from_rows(self.columns, rows)
         self.spec, self.names, self.owner = [], [], []
         idx = {c: i for i, c in enumerate(self.columns)}
-        n = len(rows)
+        n = t.n
         for c, kind in self.kinds.items():
             j = idx[c]
-            vals = [r[j] for r in rows]
+            col = t.data[j]
             if kind == "number":
-                f = np.array([np.nan if is_missing(v) else (to_float(v) if to_float(v) is not None else np.nan) for v in vals], np.float64)
+                f = to_floats(col)
                 ok = f[~np.isnan(f)]
                 if not len(ok):
                     continue
                 log = bool(ok.min() >= 0 and ok.max() > 50 and _skew(ok) > 2)
-                t = np.log1p(ok) if log else ok
-                mu, sd = float(t.mean()), float(t.std() or 1.0)
-                miss = bool(np.isnan(f).any())
+                tr = np.log1p(ok) if log else ok
+                mu, sd = float(tr.mean()), float(tr.std() or 1.0)
+                miss = bool(len(ok) < len(f))
                 self.spec.append({"col": c, "j": j, "kind": "number", "log": log, "mu": mu, "sd": sd, "missing": miss})
                 self._name(c, [c] + ([f"{c} is missing"] if miss else []))
             elif kind == "date":
-                parts = np.array([_date_parts(to_date(v)) for v in vals], np.float64)
-                mus, sds = [], []
+                parts = self._dates(col)
+                mus, sds, keep = [], [], []
                 for k in range(parts.shape[1]):
-                    col = parts[:, k][~np.isnan(parts[:, k])]
-                    mus.append(float(col.mean()) if len(col) else 0.0)
-                    sds.append(float(col.std() or 1.0) if len(col) else 1.0)
-                keep = [k for k in range(parts.shape[1]) if sds[k] > 1e-9 and len(set(parts[:, k][~np.isnan(parts[:, k])].round(6))) > 1]
+                    v = parts[:, k][~np.isnan(parts[:, k])]
+                    mus.append(float(v.mean()) if len(v) else 0.0)
+                    sds.append(float(v.std() or 1.0) if len(v) else 1.0)
+                    if len(v) and float(v.std()) > 1e-9:
+                        keep.append(k)
                 if not keep:
                     continue
                 self.spec.append({"col": c, "j": j, "kind": "date", "parts": keep, "mu": [mus[k] for k in keep], "sd": [sds[k] for k in keep]})
                 self._name(c, [f"{c} ({DATE_PARTS[k]})" for k in keep])
             elif kind == "category":
-                counts = Counter("" if is_missing(v) else v.strip() for v in vals)
+                raw = Counter(col.tolist() if col.dtype == object else [cell_str(v) for v in col])
+                counts = Counter()
+                for v, k in raw.items():
+                    counts["" if is_missing(v) else str(v).strip()] += k
                 min_count = 2 if n >= 50 else 1
                 cats = [v for v, k in counts.most_common(MAX_CATEGORIES) if k >= min_count]
                 if not cats:
@@ -389,7 +500,7 @@ class Encoder:
                 self.spec.append({"col": c, "j": j, "kind": "text", "salt": zlib.crc32(c.encode()) & 0xFFFF})
         if any(s["kind"] == "text" for s in self.spec):
             df = np.zeros(TEXT_DIM, np.float64)
-            for cols in self._hash_rows(rows):
+            for cols in self._hash_rows(t):
                 df[np.unique(cols)] += 1
             self.idf = (np.log((1 + n) / (1 + df)) + 1).astype(np.float32)
         if not self.spec:
@@ -400,26 +511,42 @@ class Encoder:
         self.names += names
         self.owner += [col] * len(names)
 
-    def _hash_rows(self, rows):
-        texts = [s for s in self.spec if s["kind"] == "text"]
-        for r in rows:
+    @staticmethod
+    def _dates(col: np.ndarray) -> np.ndarray:
+        if col.dtype != object:
+            return np.full((len(col), len(DATE_PARTS)), np.nan)
+        table = {v: _date_parts(to_date(v)) for v in set(col.tolist())}
+        return np.array([table[v] for v in col.tolist()], np.float64).reshape(len(col), len(DATE_PARTS))
+
+    def _bucket(self, salt: bytes, tok: str) -> int:
+        key = salt + tok.encode()
+        b = self._memo.get(key)
+        if b is None:
+            b = self._memo[key] = zlib.crc32(key) & (TEXT_DIM - 1)
+        return b
+
+    def _hash_rows(self, t: Table):
+        texts = [(t.data[s["j"]], s["salt"].to_bytes(2, "little")) for s in self.spec if s["kind"] == "text"]
+        memo = getattr(self, "_memo", None)
+        if memo is None:
+            self._memo = memo = {}
+        for i in range(t.n):
             cols = []
-            for s in texts:
-                v = r[s["j"]]
-                if is_missing(v):
-                    continue
-                salt = s["salt"].to_bytes(2, "little")
-                cols += [zlib.crc32(salt + t.encode()) & (TEXT_DIM - 1) for t in text_tokens(v)]
+            for col, salt in texts:
+                v = col[i]
+                if isinstance(v, str) and not is_missing(v):
+                    cols += [self._bucket(salt, tok) for tok in text_tokens(v)]
             yield np.array(cols, np.int64)
 
     # -- transforming
-    def transform(self, rows: list[list[str]]) -> XData:
-        n = len(rows)
+    def transform(self, rows) -> XData:
+        t = rows if isinstance(rows, Table) else Table.from_rows(self.columns, rows)
+        n = t.n
         blocks = []
         for s in self.spec:
-            j = s["j"]
+            col = t.data[s["j"]]
             if s["kind"] == "number":
-                f = np.array([np.nan if is_missing(r[j]) else (to_float(r[j]) if to_float(r[j]) is not None else np.nan) for r in rows], np.float64)
+                f = to_floats(col)
                 miss = np.isnan(f)
                 if s["log"]:
                     f = np.log1p(np.maximum(f, 0))
@@ -429,24 +556,24 @@ class Encoder:
                 if s["missing"]:
                     blocks.append(miss[:, None].astype(np.float64))
             elif s["kind"] == "date":
-                parts = np.array([_date_parts(to_date(r[j])) for r in rows], np.float64).reshape(n, -1)[:, s["parts"]]
+                parts = self._dates(col)[:, s["parts"]]
                 z = np.clip((parts - np.array(s["mu"])) / np.array(s["sd"]), -6, 6)
                 blocks.append(np.nan_to_num(z, nan=0.0))
             elif s["kind"] == "category":
                 pos = {v: i for i, v in enumerate(s["cats"])}
-                width = len(s["cats"]) + (1 if s["other"] else 0)
-                m = np.zeros((n, width))
-                for i, r in enumerate(rows):
-                    v = "" if is_missing(r[j]) else r[j].strip()
-                    k = pos.get(v, len(s["cats"]) if s["other"] else None)
-                    if k is not None:
-                        m[i, k] = 1.0
+                none = len(s["cats"]) if s["other"] else -1
+                vals = col.tolist() if col.dtype == object else [cell_str(v) for v in col]
+                code_of = {v: pos.get("" if is_missing(v) else str(v).strip(), none) for v in set(vals)}
+                codes = np.fromiter(map(code_of.__getitem__, vals), np.int64, count=n)
+                m = np.zeros((n, len(s["cats"]) + (1 if s["other"] else 0)), np.float32)
+                ok = codes >= 0
+                m[np.flatnonzero(ok), codes[ok]] = 1.0
                 blocks.append(m)
-        dense = (np.hstack(blocks) if blocks else np.zeros((n, 0))).astype(np.float32)
+        dense = (np.hstack([b.astype(np.float32, copy=False) for b in blocks]) if blocks else np.zeros((n, 0))).astype(np.float32)
         if self.idf is None:
             return XData(dense)
         indptr, indices, data = [0], [], []
-        for cols in self._hash_rows(rows):
+        for cols in self._hash_rows(t):
             if len(cols):
                 u, cnt = np.unique(cols, return_counts=True)
                 w = (1 + np.log(cnt)) * self.idf[u]
@@ -458,6 +585,7 @@ class Encoder:
                 indptr.append(indptr[-1])
         return XData(dense, np.array(indptr, np.int64), np.concatenate(indices) if indices else np.zeros(0, np.int64),
                      np.concatenate(data) if data else np.zeros(0, np.float32))
+
 
     # -- saving
     def state(self) -> tuple[dict, dict]:

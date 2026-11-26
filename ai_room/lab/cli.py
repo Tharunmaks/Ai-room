@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-import csv
 import os
 import sys
 import time
 from pathlib import Path
 
 from .api import write_card
-from .automl import SPEEDS, Trained, new_id, train_table
-from .data import DataError, read_table, read_text, sniff_kind
-from .textgen import TextModel, train_text
+from .automl import SECONDS_PER_MB, SPEEDS, Trained, budget_for, new_id, train_table
+from .data import DataError
+from .ingest import human, load_table, load_text, sniff_path
+from .textgen import MAX_CHARS, TextModel, train_text
 
 
 def lab_dir(data: str | None = None) -> Path:
@@ -57,38 +57,44 @@ def cmd_train(a) -> None:
     path = Path(a.file)
     if not path.exists():
         raise SystemExit(f"No such file: {path}")
-    raw = path.read_bytes()
+    speed = "fast" if a.speed == "quick" else a.speed
+    size = path.stat().st_size
+    budget = budget_for(speed, size)
     show, t0 = _printer()
+    deadline = t0 + budget
+    say = lambda text: show({"type": "stage", "text": text})
     try:
-        kind = sniff_kind(path.name, raw)
-        print(f"Learning {path.name} from scratch ({'text' if kind == 'text' else 'a table'}) …", flush=True)
+        kind = sniff_path(path, path.name)
+        print(f"Learning {path.name} ({human(size)}) from scratch as {'text' if kind == 'text' else 'a table'}; "
+              f"time allowed: {budget:.1f} s ({SECONDS_PER_MB:g} s per MB{', at least 1 s' if budget <= 1 else ''}) …", flush=True)
         if kind == "text":
-            model = train_text(read_text(raw, path.name), progress=show)
+            docs, _ = load_text(path, path.name, MAX_CHARS, say=say)
+            model = train_text(docs, progress=show, deadline=deadline - 0.12 * budget)
         elif kind == "table":
-            cols, rows = read_table(raw, path.name)
-            model = train_table(cols, rows, a.target, task=a.task, ignore=[c.strip() for c in (a.ignore or "").split(",") if c.strip()],
-                                budget=SPEEDS[a.speed], progress=show)
+            table = load_table(path, path.name, say=say)
+            model = train_table(table, None, a.target, task=a.task, ignore=[c.strip() for c in (a.ignore or "").split(",") if c.strip()],
+                                progress=show, deadline=deadline - 0.03 * budget)
         else:
             raise SystemExit("Folders of images are not supported yet.")
-    except DataError as e:
-        raise SystemExit(str(e))
-    except ValueError as e:
+    except (DataError, ValueError) as e:
         raise SystemExit(str(e))
     folder = Path(a.out) if a.out else lab_dir(a.data) / "models" / new_id()
     model.save(folder)
     secs = time.perf_counter() - t0
-    write_card(folder, model, name=a.name or path.stem, dataset_name=path.name, seconds=secs, speed=a.speed if kind != "text" else "")
+    write_card(folder, model, name=a.name or path.stem, dataset_name=path.name, seconds=secs, speed=speed, budget=budget, size=size)
     r = model.report
     print()
     if kind == "text":
-        print(f"Learned {r['chars']:,} characters in {r['seconds']:.2f} s: {r['valid_bits_per_char']:.2f} bits per character on held-back text "
+        print(f"Learned {r['learned_chars']:,} of {r['chars']:,} characters: {r['valid_bits_per_char']:.2f} bits per character on held-back text "
               f"(random guessing: {r['random_bits_per_char']:.2f}; context {r['order']} characters).")
-        print(f"Try it:  ai-room lab write {folder.name} \"Once upon\"")
+        print(f"Done in {secs:.2f} s of the {budget:.1f} s allowed.  Try it:  ai-room lab write {folder.name} \"Once upon\"")
     else:
         key, fmt = ("accuracy", "{:.1%}") if r["task"] == "classification" else ("r2", "{:.3f}")
         base = fmt.format(r["baseline_test"][key]) if r["baseline_test"] else "—"
         print(f"Winner: {r['winner_label']}. On {r['split']['test']:,} rows it never saw: {key} {fmt.format(r['test'][key])} (no learning: {base}).")
-        print(f"Learned in {secs:.1f} s; the first model was ready after {r['first_model_seconds']:.2f} s.")
+        print(f"Done in {secs:.2f} s of the {budget:.1f} s allowed; the first model was ready after {r['first_model_seconds']:.2f} s.")
+        if r.get("sampled"):
+            print(f"The file has about {r['file_rows']:,} rows; it learned from a random sample of {r['rows']:,}.")
         if r["importance"]:
             print("Relies most on: " + ", ".join(f"{i['column']} ({i['share']:.0%})" for i in r["importance"][:5]))
         print(f"Use it:  ai-room lab predict {folder.name} new_rows.csv")
@@ -96,21 +102,20 @@ def cmd_train(a) -> None:
 
 
 def cmd_predict(a) -> None:
+    from .api import predict_table_file
     m = load(find_model(a.model, a.data))
     if isinstance(m, TextModel):
         raise SystemExit("That is a text model: use `ai-room lab write` or `ai-room lab ask`.")
     path = Path(a.file)
-    cols, rows = read_table(path.read_bytes(), path.name)
-    preds = m.predict([dict(zip(cols, r)) for r in rows])
-    out = open(a.out, "w", newline="", encoding="utf-8") if a.out else sys.stdout
-    w = csv.writer(out)
-    cls = m.task.kind == "classification"
-    w.writerow(cols + [f"predicted {m.target}"] + (["confidence"] if cls else []))
-    for r, p in zip(rows, preds):
-        w.writerow(r + ([p["prediction"], round(p["confidence"], 4)] if cls else [round(p["prediction"], 6)]))
-    if a.out:
-        out.close()
-        print(f"Wrote {len(rows):,} predictions to {a.out}")
+    out = Path(a.out) if a.out else None
+    import tempfile
+    target = out or Path(tempfile.mkstemp(suffix=".csv")[1])
+    n = predict_table_file(m, path, path.name, target)
+    if out:
+        print(f"Wrote {n:,} predictions to {out}")
+    else:
+        sys.stdout.write(target.read_text(encoding="utf-8"))
+        target.unlink()
 
 
 def cmd_write(a) -> None:
@@ -160,7 +165,8 @@ def add_parser(sub) -> None:
     t.add_argument("--target", help="column to predict (default: guessed, usually the last)")
     t.add_argument("--task", choices=["auto", "classification", "regression"], default="auto")
     t.add_argument("--ignore", help="comma-separated columns to leave out")
-    t.add_argument("--speed", choices=list(SPEEDS), default="balanced", help="time budget: quick ≈8 s, balanced ≈30 s, thorough ≈2 min")
+    t.add_argument("--speed", choices=list(SPEEDS) + ["quick"], default="fast",
+                   help="time allowed: fast = 1 s per MB of data (at least 1 s); balanced ≥ 30 s; thorough ≥ 2 min")
     t.add_argument("--name")
     t.add_argument("--out", help="folder to save the model in (default: data/lab/models/<id>)")
     p = ls.add_parser("predict", help="add predictions to every row of a table")

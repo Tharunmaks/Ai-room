@@ -21,24 +21,34 @@ from pathlib import Path
 
 import numpy as np
 
-SHIFT = 20                       # low bits of a key hold the next character
-MASK = (1 << SHIFT) - 1
+CBITS = 14                       # a character id takes 14 bits (up to 16,383 different characters)
+CMASK = (1 << CBITS) - 1
+CTX = 36                         # a context is remembered by a 36-bit hash; key = context << 14 | next character
 PRIME = np.uint64(0x9E3779B97F4A7C15)
-MAX_CHARS = 4_000_000            # longer uploads are learned from their first 4 million characters
+MAX_CHARS = int(float(__import__("os").environ.get("AI_ROOM_LAB_TEXT_CHARS", 32_000_000)))   # learned at most; bigger texts are sampled
+U = np.uint64
 
 
 def _mix(h: np.ndarray) -> np.ndarray:
-    return (h ^ (h >> np.uint64(29))) >> np.uint64(SHIFT)
+    return (h ^ (h >> U(29))) >> U(64 - CTX)
 
 
 def _discounts(c: np.ndarray) -> tuple[float, float, float]:
     """Modified Kneser–Ney discounts for counts of 1, 2 and 3+ (Chen & Goodman), estimated from counts-of-counts."""
-    n = [int((c == k).sum()) for k in (1, 2, 3, 4)]
+    n = np.bincount(np.minimum(c, 5).astype(np.int64), minlength=6)[1:5].tolist()
     if min(n) == 0:
         return (0.5, 1.0, 1.5) if n[0] == 0 or n[1] == 0 else (0.6, 1.1, 1.5)
     y = n[0] / (n[0] + 2 * n[1])
     d = (1 - 2 * y * n[1] / n[0], 2 - 3 * y * n[2] / n[1], 3 - 4 * y * n[3] / n[2])
     return tuple(float(np.clip(v, 0.05, k + 0.95)) for k, v in zip((0, 1, 2), d))
+
+
+def _runs(s: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Distinct values and how often each occurs, for an already sorted array."""
+    if not len(s):
+        return s, np.zeros(0, np.int64)
+    starts = np.concatenate([[0], np.flatnonzero(s[1:] != s[:-1]) + 1])
+    return s[starts], np.diff(np.append(starts, len(s)))
 
 
 class Stats:
@@ -47,15 +57,15 @@ class Stats:
     def __init__(self, keys: np.ndarray, counts: np.ndarray, disc=None):
         self.keys, self.counts = keys, counts.astype(np.uint32)
         self.disc = tuple(disc) if disc else _discounts(self.counts)
-        cx = keys >> np.uint64(SHIFT)
-        self.ctx, start = np.unique(cx, return_index=True)
-        c = self.counts.astype(np.float64)
-        if len(c):
-            self.tot = np.add.reduceat(c, start)
-            d1, d2, d3 = self.disc
-            dsum = np.where(c == 1, d1, np.where(c == 2, d2, d3))
-            self.gamma = np.add.reduceat(dsum, start) / self.tot
+        cx = keys >> U(CBITS)
+        if len(cx):
+            start = np.concatenate([[0], np.flatnonzero(cx[1:] != cx[:-1]) + 1])
+            self.ctx = cx[start]
+            self.tot = np.add.reduceat(self.counts, start, dtype=np.float64)
+            dlut = np.array([0.0, *self.disc], np.float64)
+            self.gamma = np.add.reduceat(dlut[np.minimum(self.counts, 3)], start) / self.tot
         else:
+            self.ctx = cx
             self.tot = self.gamma = np.zeros(0)
 
     def apply(self, cx: np.ndarray, nxt: np.ndarray, p_lower: np.ndarray) -> np.ndarray:
@@ -64,7 +74,7 @@ class Stats:
             return p_lower
         i = np.clip(np.searchsorted(self.ctx, cx), 0, len(self.ctx) - 1)
         found = self.ctx[i] == cx
-        key = (cx << np.uint64(SHIFT)) | nxt.astype(np.uint64)
+        key = (cx << U(CBITS)) | nxt.astype(np.uint64)
         j = np.clip(np.searchsorted(self.keys, key), 0, len(self.keys) - 1)
         cnt = np.where(self.keys[j] == key, self.counts[j], 0).astype(np.float64)
         d1, d2, d3 = self.disc
@@ -77,9 +87,9 @@ class Stats:
         i = int(np.searchsorted(self.ctx, cx))
         if i >= len(self.ctx) or self.ctx[i] != cx:
             return p
-        lo = int(np.searchsorted(self.keys, cx << np.uint64(SHIFT)))
-        hi = int(np.searchsorted(self.keys, (cx + np.uint64(1)) << np.uint64(SHIFT)))
-        nexts = (self.keys[lo:hi] & np.uint64(MASK)).astype(np.int64)
+        lo = int(np.searchsorted(self.keys, cx << U(CBITS)))
+        hi = int(np.searchsorted(self.keys, (cx + U(1)) << U(CBITS)))
+        nexts = (self.keys[lo:hi] & U(CMASK)).astype(np.int64)
         cnt = self.counts[lo:hi].astype(np.float64)
         d1, d2, d3 = self.disc
         d = np.where(cnt == 1, d1, np.where(cnt == 2, d2, d3))
@@ -88,26 +98,29 @@ class Stats:
         return p
 
 
-def _positions(seq: np.ndarray, order: int):
-    """Context hashes for k = 1..order (generated one k at a time) and the next characters."""
-    P = np.concatenate([np.zeros(order, np.int64), seq])
-    n = len(seq)
-    nxt = P[order:]
+def _hashes(P1: np.ndarray, order: int, pad: int):
+    """For k = 1..order: the hash of the k characters before each position. P1 = character ids + 1 as uint64,
+    starting with `pad` padding entries."""
+    n = len(P1) - pad
+    h = np.zeros(n, np.uint64)
+    with np.errstate(over="ignore"):
+        for k in range(1, order + 1):
+            h *= PRIME
+            h += P1[pad - k: pad - k + n]
+            yield k, _mix(h)
 
-    def gen():
-        h = np.zeros(n, np.uint64)
-        with np.errstate(over="ignore"):
-            for k in range(1, order + 1):
-                h = h * PRIME + (P[order - k: order - k + n].astype(np.uint64) + np.uint64(1))
-                yield _mix(h)
-    return gen(), nxt
+
+def _padded(ids: np.ndarray, pad: int) -> np.ndarray:
+    return np.concatenate([np.ones(pad, np.uint64), ids.astype(np.uint64) + U(1)])
 
 
 class CharModel:
     """Character model with interpolated modified Kneser–Ney smoothing.
 
     The longest context uses real counts; shorter contexts use 'continuation' counts (in how many different
-    contexts a character sequence appears), which is what makes Kneser–Ney better than plain back-off."""
+    contexts a character sequence appears), which is what makes Kneser–Ney better than plain back-off.
+    Counting uses only plain sorts of 64-bit numbers: a (context, next, previous character) triple is packed
+    into one number, so distinct triples, and hence continuation counts, come out of a sort."""
 
     def __init__(self, max_order: int = 10):
         self.max_order = max_order
@@ -115,90 +128,138 @@ class CharModel:
         self.chars: list[str] = []
         self.levels: list[Stats] = []     # levels[k-1] = context length k (continuation counts, except the last)
         self.report: dict = {}
+        self._lut: dict | None = None
 
-    def _encode(self, text: str, grow: bool = False) -> np.ndarray:
-        if grow:
-            self.chars = sorted(set(text))
-            if len(self.chars) >= MASK:
-                raise ValueError("too many different characters")
-        pos = {c: i + 1 for i, c in enumerate(self.chars)}
-        return np.array([pos.get(c, 0) for c in text], np.int64)
+    # -- characters <-> ids (0 is padding; the rarest characters share the last id if there are too many)
+    def _vocab(self, text: str) -> np.ndarray:
+        cp = np.frombuffer(text.encode("utf-32-le", "surrogatepass"), dtype=np.uint32)
+        freq = np.bincount(cp)
+        present = np.flatnonzero(freq)
+        if len(present) > CMASK - 1:
+            present = np.sort(present[np.argsort(-freq[present], kind="stable")[: CMASK - 2]])
+            self.rare = True
+        else:
+            self.rare = False
+        self.chars = [chr(c) for c in present] + (["�"] if self.rare else [])
+        return self._ids(cp)
 
-    def _count(self, seq: np.ndarray, order: int, raw_all: bool = False):
-        """Statistics for context lengths 1..order: raw counts (all lengths if raw_all, else only the longest) and
-        continuation counts for the shorter ones. The continuation count of (context, next) is the number of different
-        one-longer contexts it appears in, read off the distinct keys of the next length."""
-        hashes, nxt = _positions(seq, order)
-        nxt64 = nxt.astype(np.uint64)
+    def _ids(self, cp: np.ndarray) -> np.ndarray:
+        codes = np.array([ord(c) for c in self.chars[: len(self.chars) - self.rare]], np.uint32)
+        lut = np.full(max(int(codes.max()) + 1 if len(codes) else 1, int(cp.max()) + 1 if len(cp) else 1), len(self.chars) if self.rare else 0, np.int64)
+        lut[codes] = np.arange(1, len(codes) + 1)
+        return lut[cp]
+
+    def _encode(self, text: str) -> np.ndarray:
+        return self._ids(np.frombuffer(text.encode("utf-32-le", "surrogatepass"), dtype=np.uint32))
+
+    def _count(self, ids: np.ndarray, order: int, raw_all: bool = False, stop_at: float | None = None):
+        """Raw counts (all lengths if raw_all, else only the longest) and continuation counts for 1..order."""
+        pad = order + 1
+        P1 = _padded(ids, pad)
+        n = len(ids)
+        nxt = P1[pad:] - U(1)
         raw, cont = [None] * order, [None] * order
-        prev = None
-        for k, h in enumerate(hashes):
-            key = (h << np.uint64(SHIFT)) | nxt64
-            if k:
-                u, first, c = np.unique(key, return_index=True, return_counts=True)
-                u2, cc = np.unique(prev[first], return_counts=True)
-                cont[k - 1] = Stats(u2, cc)
+        got = order
+        for k, h in _hashes(P1, order, pad):
+            key = h << U(CBITS)
+            key |= nxt
+            if k < order:
+                # one sort of (context, next, previous character) gives everything: the keys come out sorted with
+                # their raw counts, and the distinct triples give the continuation counts
+                triples = key << U(CBITS)
+                triples |= P1[pad - k - 1: pad - k - 1 + n]          # previous character + 1 (padding = 1)
+                triples.sort()
+                if raw_all:
+                    raw[k - 1] = Stats(*_runs(triples >> U(CBITS)))
+                cont[k - 1] = Stats(*_runs(_runs(triples)[0] >> U(CBITS)))
+                del triples
             else:
-                u, c = np.unique(key, return_counts=True)
-            if raw_all or k == order - 1:
-                raw[k] = Stats(u, c)
-            if k == 0:
-                first_level = u
-            prev = key
+                raw[k - 1] = Stats(*_runs(np.sort(key)))
+            if k == 1:
+                first = (raw[0] or cont[0]).keys
+            if stop_at is not None and time.perf_counter() > stop_at and k < order and (raw_all or k == order):
+                got = k
+                break
+        raw, cont = raw[:got], cont[:got]
+        if got < order:
+            cont[-1] = None
         V = len(self.chars)
         # unigram continuation: in how many different one-character contexts each character appears
-        cu = np.bincount((first_level & np.uint64(MASK)).astype(np.int64), minlength=V + 1).astype(np.float64)
+        cu = np.bincount((first & U(CMASK)).astype(np.int64), minlength=V + 1).astype(np.float64)
         self.p0 = (cu + 0.5) / (cu.sum() + 0.5 * (V + 1))
         self.p0[0] = 0.0
         self.p0 /= self.p0.sum()
-        return raw, cont
+        return raw, cont, got
 
-    def fit(self, text: str, progress=None) -> "CharModel":
+    def fit(self, text: str, progress=None, deadline: float | None = None) -> "CharModel":
+        """Choose the context length on held-back text, then learn as much of the text as the time allows.
+
+        The choice is made on up to 2 million characters from 20 evenly spaced places (90% learned, 10% held back).
+        Then the whole text is learned once at the chosen length (all of it, unless the deadline says otherwise)."""
         t0 = time.perf_counter()
         say = progress or (lambda **k: None)
         text = text[:MAX_CHARS]
         if len(text) < 200:
             raise ValueError("The text is too short to learn from. Upload at least a few paragraphs.")
-        self._encode(text, grow=True)
-        sample = text if len(text) <= 1_200_000 else text[:1_080_000] + text[-120_000:]
-        cut = int(len(sample) * 0.9)
-        tr, va = self._encode(sample[:cut]), self._encode(sample[cut:])
+        ids = self._vocab(text)
+        # the choice is made on (at most) 2 million characters taken from 20 evenly spaced places, each split 90/10,
+        # so both the learned part and the held-back part represent the whole text, not just its beginning
+        S = min(len(ids), 2_000_000)
+        pieces = 20 if len(ids) > 200_000 else 1
+        size = S // pieces
+        starts = np.linspace(0, len(ids) - size, pieces).astype(np.int64)
+        tr = np.concatenate([ids[a: a + int(size * 0.9)] for a in starts])
+        va = np.concatenate([ids[a + int(size * 0.9): a + size] for a in starts])
+        budget = None if deadline is None else max(0.05, deadline - t0)
         say(stage="counting", text=f"Counting contexts of 1–{self.max_order} characters in {len(tr):,} characters…")
-        raw, cont = self._count(tr, self.max_order, raw_all=True)
-        say(stage="choosing", text="Measuring how well each context length predicts the held-back tenth…")
+        t1 = time.perf_counter()
+        raw, cont, got = self._count(tr, self.max_order, raw_all=True, stop_at=None if budget is None else t0 + 0.45 * budget)
+        rate = len(tr) * got / max(time.perf_counter() - t1, 1e-6) * 1.4      # characters × lengths per second (the final pass does less work)
+        if got < self.max_order:
+            say(stage="counting", text=f"Out of time after contexts of {got} characters; choosing among those.")
         curve = self._curve(tr, va, raw, cont)
         best = int(np.argmin(curve)) + 1
         uni = np.bincount(tr, minlength=len(self.chars) + 1).astype(np.float64)[1:] + 0.5
         vv = va[va > 0]
         uni_bits = float(-np.log2(uni[vv - 1] / uni.sum()).mean()) if len(vv) else 0.0
-        say(stage="final", text=f"Best context: {best} characters. Learning all of the text with it…")
         self.order = best
-        raw, cont = self._count(self._encode(text), best)
-        self.levels = cont[:-1] + [raw[-1]]
+        self.levels = cont[: best - 1] + [raw[best - 1]]
+        learned = len(tr)
+        left = None if deadline is None else deadline - time.perf_counter() - 0.03 * budget
+        can = len(ids) if left is None else int(rate * max(left, 0) / best)
+        if can >= min(len(ids), max(len(tr) * 1.05, 50_000)) or (pieces > 1 and can >= len(tr)):
+            take = min(len(ids), can)
+            say(stage="final", text=f"Best context: {best} characters. Learning {'all of the text' if take == len(ids) else f'the first {take:,} characters'} with it…")
+            del raw, cont
+            raw2, cont2, _ = self._count(ids[:take], best)
+            self.levels = cont2[:-1] + [raw2[-1]]
+            learned = take
+        else:
+            say(stage="final", text=f"Best context: {best} characters. Keeping the model learned from the first {learned:,} characters (no time for more).")
         secs = time.perf_counter() - t0
         V = len(self.chars)
-        self.report = {"chars": len(text), "vocab": V, "order": best, "seconds": round(secs, 3), "chars_per_second": round(len(text) / max(secs, 1e-9)),
-                       "valid_bits_per_char": round(float(curve[best - 1]), 4), "bits_by_order": [round(float(b), 4) for b in curve],
-                       "random_bits_per_char": round(math.log2(max(V, 2)), 4), "letter_frequency_bits_per_char": round(uni_bits, 4),
-                       "contexts": int(sum(len(l.keys) for l in self.levels))}
+        self.report = {"chars": len(text), "learned_chars": learned, "vocab": V, "order": best, "seconds": round(secs, 3),
+                       "chars_per_second": round(learned / max(secs, 1e-9)), "valid_bits_per_char": round(float(curve[best - 1]), 4),
+                       "valid_chars": int(len(va)), "bits_by_order": [round(float(b), 4) for b in curve], "random_bits_per_char": round(math.log2(max(V, 2)), 4),
+                       "letter_frequency_bits_per_char": round(uni_bits, 4), "contexts": int(sum(len(l.keys) for l in self.levels))}
         return self
 
     def _curve(self, tr, va, raw, cont) -> np.ndarray:
         """Bits per character on `va` (following `tr`) if the longest context were 1, 2, … characters."""
         order = len(raw)
-        seq = np.concatenate([tr[-(order + 1):], va])
-        hashes, nxt = _positions(seq, order)
-        sel = slice(len(seq) - len(va), None)
-        target = nxt[sel]
+        ctx = tr[-(order + 1):]
+        P1 = _padded(np.concatenate([ctx, va]), order + 1 - len(ctx) + len(ctx))
+        P1[: order + 1 - len(ctx)] = 1
+        pad = len(P1) - len(va)
+        target = va
         ok = target > 0
         p = self.p0[target]
         out = []
-        for k, h in enumerate(hashes):
-            cx = h[sel]
-            top = raw[k].apply(cx, target, p)
+        for k, h in _hashes(P1, order, pad):
+            top = raw[k - 1].apply(h, target, p)
             out.append(float(-np.log2(np.clip(top[ok], 1e-12, 1)).mean()) if ok.any() else 0.0)
-            if cont[k] is not None:
-                p = cont[k].apply(cx, target, p)
+            if cont[k - 1] is not None:
+                p = cont[k - 1].apply(h, target, p)
         return np.array(out)
 
     def bits(self, text: str) -> float:
@@ -206,22 +267,23 @@ class CharModel:
         seq = self._encode(text)
         if not len(seq):
             return float("nan")
-        hashes, nxt = _positions(seq, self.order)
-        p = self.p0[nxt]
-        for h, lv in zip(hashes, self.levels):
-            p = lv.apply(h, nxt, p)
-        ok = nxt > 0
+        pad = self.order + 1
+        P1 = _padded(seq, pad)
+        p = self.p0[seq]
+        for (k, h), lv in zip(_hashes(P1, self.order, pad), self.levels):
+            p = lv.apply(h, seq, p)
+        ok = seq > 0
         return float(-np.log2(np.clip(p[ok], 1e-12, 1)).mean()) if ok.any() else float("nan")
 
     # -- writing
     def next_distribution(self, history: list[int]) -> np.ndarray:
         p = self.p0.copy()
         hist = [0] * max(0, self.order - len(history)) + history[-self.order:]
-        h = np.uint64(0)
+        h = U(0)
         with np.errstate(over="ignore"):
             for k, lv in enumerate(self.levels, 1):
-                h = h * PRIME + np.uint64(hist[-k] + 1)
-                p = lv.update(_mix(h), p)
+                h = h * PRIME + U(hist[-k] + 1)
+                p = lv.update(_mix(np.array([h]))[0], p)
         return p
 
     def generate(self, prompt: str = "", length: int = 400, temperature: float = 0.8, seed: int | None = None) -> str:
@@ -243,13 +305,15 @@ class CharModel:
     # -- saving
     def state(self) -> tuple[dict, dict]:
         arrays = {"p0": self.p0} | {f"k{i}": l.keys for i, l in enumerate(self.levels)} | {f"c{i}": l.counts for i, l in enumerate(self.levels)}
-        return {"chars": "".join(self.chars), "order": self.order, "max_order": self.max_order, "disc": [list(l.disc) for l in self.levels],
-                "report": self.report}, arrays
+        return {"format": 2, "chars": "".join(self.chars), "rare": self.rare, "order": self.order, "max_order": self.max_order,
+                "disc": [list(l.disc) for l in self.levels], "report": self.report}, arrays
 
     @classmethod
     def from_state(cls, meta: dict, arrays: dict) -> "CharModel":
+        if meta.get("format") != 2:
+            raise ValueError("This text model was saved by an older version of the Lab. Train it again.")
         m = cls(meta["max_order"])
-        m.chars, m.order, m.report = list(meta["chars"]), meta["order"], meta["report"]
+        m.chars, m.rare, m.order, m.report = list(meta["chars"]), meta["rare"], meta["order"], meta["report"]
         m.p0 = arrays["p0"]
         m.levels = [Stats(arrays[f"k{i}"], arrays[f"c{i}"], meta["disc"][i]) for i in range(m.order)]
         return m
@@ -330,8 +394,8 @@ class TextModel:
         folder = Path(folder)
         folder.mkdir(parents=True, exist_ok=True)
         meta, arrays = self.model.state()
-        np.savez_compressed(folder / "weights.npz", **arrays)
-        (folder / "model.json").write_text(json.dumps({"format": 1, "type": "text", "model": meta, "titles": self.titles, "report": self.report}))
+        np.savez(folder / "weights.npz", **arrays)          # uncompressed: saving must not eat the time budget
+        (folder / "model.json").write_text(json.dumps({"format": 2, "type": "text", "model": meta, "titles": self.titles, "report": self.report}))
         (folder / "passages.json").write_text(json.dumps(self.passages, ensure_ascii=False))
         return folder
 
@@ -344,7 +408,8 @@ class TextModel:
         return cls(CharModel.from_state(meta["model"], arrays), json.loads((folder / "passages.json").read_text()), meta["titles"])
 
 
-def train_text(docs: list[tuple[str, str]], max_order: int = 10, progress=None, stop=None) -> TextModel:
+def train_text(docs: list[tuple[str, str]], max_order: int = 10, progress=None, stop=None, deadline: float | None = None) -> TextModel:
+    """Learn the documents. With a `deadline` (a time.perf_counter() value) it learns as much as fits before then."""
     emit = progress or (lambda e: None)
     t0 = time.perf_counter()
     text = "\n\n".join(t.strip() for _, t in docs if t.strip())
@@ -353,7 +418,7 @@ def train_text(docs: list[tuple[str, str]], max_order: int = 10, progress=None, 
         emit({"type": "stage", "stage": stage, "text": text, "t": round(time.perf_counter() - t0, 3)})
 
     say("reading", f"Read {len(docs)} document{'s' * (len(docs) != 1)}, {len(text):,} characters.")
-    m = CharModel(max_order).fit(text, progress=lambda **k: say(k["stage"], k["text"]))
+    m = CharModel(max_order).fit(text, progress=lambda **k: say(k["stage"], k["text"]), deadline=deadline)
     passages = passages_of(docs)
     tm = TextModel(m, passages, [t for t, _ in docs])
     emit({"type": "done", "report": tm.report})

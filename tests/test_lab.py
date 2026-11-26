@@ -3,7 +3,6 @@
 import csv
 import io
 import json
-import math
 import threading
 import time
 
@@ -14,7 +13,7 @@ from fastapi.testclient import TestClient
 from ai_room.lab import samples
 from ai_room.lab.automl import Trained, split_rows, train_table
 from ai_room.lab.data import DataError, Encoder, profile, read_table, read_text, sniff_kind
-from ai_room.lab.learners import Baseline, Boosted, Neural, OneShot, Task, feature_edges, find_bundles, grow_tree, linear, tree_leaves
+from ai_room.lab.learners import Boosted, Neural, OneShot, Task, feature_edges, find_bundles, grow_tree, linear, tree_leaves
 from ai_room.lab.textgen import CharModel, Passages, TextModel, passages_of, train_text
 from ai_room.server import create_app
 
@@ -305,7 +304,9 @@ def test_api_text_model_writes_and_answers(lab):
 
 def test_api_samples_errors_and_safety(lab):
     info = lab.get("/api/lab/info").json()
-    assert set(info["speeds"]) == {"quick", "balanced", "thorough"} and {s["key"] for s in info["samples"]} == set(samples.SAMPLES)
+    assert [s["key"] for s in info["speeds"]] == ["fast", "balanced", "thorough"] and info["speeds"][0]["label"] == "1 s per MB"
+    assert info["max_bytes"] == 5 * 10**12 and info["max_label"] == "5.0 TB" and info["seconds_per_mb"] == 1.0
+    assert {s["key"] for s in info["samples"]} == set(samples.SAMPLES)
     sp = lab.post("/api/lab/samples/spirals").json()
     assert sp["rows"] == 1200 and sp["target"] == "arm" and sp["sample"] == "spirals"
     assert lab.post("/api/lab/samples/nope").status_code == 404
@@ -337,3 +338,96 @@ def test_cli_trains_predicts_and_lists(tmp_path, capsys):
     assert mid in capsys.readouterr().out
     card = json.loads((lab_dir / "models" / mid / "card.json").read_text())
     assert card["type"] == "table" and card["inputs"]
+
+
+# ------------------------------------------------------------------ size limits and the 1 second per MB budget
+def test_budget_is_one_second_per_megabyte():
+    from ai_room.lab.automl import budget_for
+    assert budget_for("fast", 0) == 1.0 and budget_for("fast", 500_000) == 1.0           # at least 1 s
+    assert budget_for("fast", 7_500_000) == pytest.approx(7.5) and budget_for("quick", 50e6) == pytest.approx(50)
+    assert budget_for("fast", 5e12) == pytest.approx(5_000_000)                           # 5 TB → 5 million seconds at most
+    assert budget_for("balanced", 1e6) == 30 and budget_for("balanced", 100e6) == pytest.approx(100)
+
+
+def test_upload_streams_to_disk_and_enforces_the_size_cap_and_free_space(lab, monkeypatch):
+    import ai_room.lab.api as api
+    cols, rows = rings(200)
+    body = table_bytes(cols, rows)
+    monkeypatch.setattr(api, "MAX_BYTES", len(body) - 1)
+    r = lab.post("/api/lab/datasets?filename=big.csv", content=body)
+    assert r.status_code == 413 and "limit" in r.json()["detail"]
+    monkeypatch.setattr(api, "MAX_BYTES", 5 * 10**12)
+
+    class Tiny:
+        free = 1000
+    monkeypatch.setattr(api.shutil, "disk_usage", lambda p: Tiny)
+    r = lab.post("/api/lab/datasets?filename=big.csv", content=body)
+    assert r.status_code == 507 and "disk space" in r.json()["detail"]
+    monkeypatch.undo()
+    assert lab.get("/api/lab/datasets").json() == []                 # nothing half-written is left behind
+    up = lab.post("/api/lab/datasets?filename=ok.csv", content=body).json()
+    assert up["rows"] == 200 and up["rows_exact"] and up["budget_seconds"] == 1.0
+
+
+def test_a_training_job_finishes_within_one_second_per_megabyte(lab):
+    rng = np.random.default_rng(3)
+    X = rng.normal(size=(40_000, 6))
+    y = np.where(X[:, 0] * X[:, 1] + X[:, 2] > 0, "yes", "no")
+    body = table_bytes([f"f{i}" for i in range(6)] + ["label"], [[f"{v:.5f}" for v in x] + [t] for x, t in zip(X, y)])
+    up = lab.post("/api/lab/datasets?filename=mid.csv", content=body).json()
+    budget = up["budget_seconds"]
+    assert budget == pytest.approx(len(body) / 1e6, rel=1e-3) and budget > 2
+    j = wait_job(lab, lab.post("/api/lab/train", json={"dataset": up["id"]}).json()["id"])
+    assert j["status"] == "done" and j["budget"] == pytest.approx(budget, abs=0.01)
+    assert j["seconds"] <= budget * 1.15 + 0.3, (j["seconds"], budget)
+    card = lab.get(f"/api/lab/models/{j['model']}").json()
+    assert card["score"]["accuracy"] > 0.85 and card["budget"] == pytest.approx(budget, abs=0.01)
+
+
+def test_tables_with_more_cells_than_memory_are_sampled(tmp_path):
+    from ai_room.lab.ingest import load_table
+    n = 500_000
+    a = np.random.default_rng(0).normal(size=(n, 2))
+    lines = ["a,b,c"] + [f"{x:.5f},{z:.5f},{'p' if x + z > 0 else 'q'}" for x, z in a]
+    path = tmp_path / "big.csv"
+    path.write_text("\n".join(lines) + "\n")
+    assert path.stat().st_size > 8 << 20                                   # big enough to be read by random seeks
+    t = load_table(path, "big.csv", limit_cells=30_000)
+    assert t.sampled and not t.exact and 9_000 <= t.n <= 10_000 and abs(t.total_rows - n) / n < 0.1
+    assert set(t.col("c").tolist()) == {"p", "q"} and np.isfinite(t.col("a").astype(float)).all()
+    assert len(set(zip(t.col("a").tolist(), t.col("b").tolist()))) == t.n            # every row at most once
+    half = load_table(path, "big.csv", limit_cells=600_000)                          # 40% of the rows: one sequential pass
+    assert half.sampled and 180_000 <= half.n <= 210_000 and len(set(zip(half.col("a").tolist(), half.col("b").tolist()))) == half.n
+    full = load_table(path, "big.csv", limit_cells=10**9)
+    assert full.n == n and not full.sampled
+    small = tmp_path / "small.csv"
+    small.write_text("x,y\n" + "\n".join(f"{i},{i % 3}" for i in range(2000)) + "\n")
+    s = load_table(small, "small.csv", limit_cells=1000)                  # small files: loaded, then a random sample kept
+    assert s.sampled and s.n == 1000 and s.total_rows == 2000                 # never fewer than 1,000 rows
+
+
+def test_all_numeric_files_take_the_fast_parser(tmp_path):
+    from ai_room.lab.ingest import load_table
+    rng = np.random.default_rng(1)
+    rows = [",".join(f"{v:.6f}" for v in r) for r in rng.normal(size=(150_000, 8))]
+    path = tmp_path / "nums.csv"
+    path.write_text("a,b,c,d,e,f,g,h\n" + "\n".join(rows) + "\n")
+    t = load_table(path, "nums.csv")
+    assert t.n == 150_000 and all(c.dtype == np.float64 for c in t.data)
+    prof = profile(t)
+    assert all(p["kind"] == "number" for p in prof)
+
+
+def test_big_texts_are_sampled_evenly_and_text_learning_meets_its_deadline(tmp_path):
+    from ai_room.lab.ingest import load_text
+    path = tmp_path / "big.txt"
+    path.write_text(("".join(f"Chapter {i}. " + STORY[:2000] + "\n" for i in range(3000))))
+    docs, info = load_text(path, "big.txt", max_chars=1_000_000)
+    assert info["sampled"] and info["pieces"] == 1 and len(docs) == 1
+    docs, info = load_text(path, "big.txt", max_chars=3_000_000)
+    assert not info["sampled"] or info["pieces"] >= 2
+    text = STORY * 30
+    t0 = time.perf_counter()
+    m = CharModel().fit(text, deadline=t0 + 0.4)
+    assert time.perf_counter() - t0 < 1.0 and 1 <= m.order <= 10 and m.report["learned_chars"] <= len(text)
+    assert abs(m.next_distribution([1, 2]).sum() - 1) < 1e-9

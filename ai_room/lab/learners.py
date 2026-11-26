@@ -170,6 +170,9 @@ class OneShot(Learner):
         # as many hidden units as fit in about a third of a second of arithmetic, between 256 and max_features
         M = int(np.clip(min(n, math.sqrt(2e10 / max(n, 1))), 256, self.max_features))
         M = max(64, min(M, 3000 - d))
+        left = max(0.01, deadline - time.perf_counter())
+        while M > 64 and (n * (d + M) ** 2 + 4 * (d + M) ** 3) / 1.2e10 > 0.6 * left:     # arithmetic that fits the time
+            M = int(M * 0.7)
         if task.kind == "classification":
             T = np.full((n, task.classes), -1.0 / task.classes, F32)
             T[np.arange(n), ytr] += 1.0
@@ -178,12 +181,13 @@ class OneShot(Learner):
         t0 = time.perf_counter()
         scales = (0.5, 1.0, 2.0)
         # choose the kernel width with a small version of the network (on at most 3,000 rows), then solve the full one once
-        idx = rng.choice(n, 3000, replace=False) if n > 3000 else np.arange(n)
-        vi = np.arange(min(len(yva), 3000))
+        small = left < 0.6
+        idx = rng.choice(n, 1000 if small else 3000, replace=False) if n > (1000 if small else 3000) else np.arange(n)
+        vi = np.arange(min(len(yva), 1000 if small else 3000))
         trial = []
         for sc in scales:
-            trial.append((self._solve(X[idx], T[idx], Xv[vi], yva[vi], task, min(M, 384), sc, rng, 8)[0], sc))
-            if _stopped(deadline, stop):
+            trial.append((self._solve(X[idx], T[idx], Xv[vi], yva[vi], task, min(M, 128 if small else 384), sc, rng, 8)[0], sc))
+            if time.perf_counter() > t0 + 0.3 * left:
                 break
         scale = max(trial)[1]
         report(step=1, total=2, val=max(trial)[0], note=f"chose kernel width ×{scale}")
@@ -666,6 +670,8 @@ class Neural(Learner):
             perm = rng.permutation(n)
             tl, tn = 0.0, 0
             for s in range(0, n, batch):
+                if step and step % 16 == 0 and time.perf_counter() > deadline:
+                    break                                   # out of time: keep what this epoch learned so far
                 idx = perm[s:s + batch]
                 xb, yb = Xtr.take(idx), yt[idx]
                 acts, out = self._forward(xb, (Wd, Ws, W, b), rng)

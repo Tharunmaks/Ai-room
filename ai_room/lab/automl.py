@@ -9,7 +9,6 @@ The rows are split three ways before anything is learned:
 from __future__ import annotations
 
 import json
-import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -17,10 +16,21 @@ from pathlib import Path
 
 import numpy as np
 
-from .data import DataError, Encoder, XData, is_missing, pick_target, pick_task, profile, to_float
-from .learners import KINDS, Baseline, Boosted, Learner, Neural, OneShot, Task, linear, log_loss, softmax
+from .data import DataError, Encoder, Table, XData, cell_str, missing_mask, pick_target, pick_task, profile, to_float, to_floats
+from .learners import Baseline, Boosted, Learner, Neural, OneShot, Task, linear, log_loss
 
-SPEEDS = {"quick": 8.0, "balanced": 30.0, "thorough": 120.0}
+SECONDS_PER_MB = 1.0
+# fast: the whole job (reading, learning, testing, saving) gets 1 second per MB of data, at least 1 second.
+# balanced / thorough: at least 30 s / 2 min, for more accuracy on small files (never less than 1 s per MB).
+SPEEDS = {"fast": 1.0, "balanced": 30.0, "thorough": 120.0}
+SPEED_LABELS = {"fast": "1 s per MB", "balanced": "≈30 s", "thorough": "≈2 min"}
+
+
+def budget_for(speed: str, size_bytes: float) -> float:
+    """Seconds a training job may take: 1 s per MB (1 MB = 1,000,000 bytes), at least SPEEDS[speed]."""
+    speed = "fast" if speed == "quick" else speed
+    per_mb = max(1.0, size_bytes / 1e6 * SECONDS_PER_MB)
+    return per_mb if speed == "fast" else max(SPEEDS.get(speed, 30.0), per_mb)
 SHARES = {"linear": 0.08, "oneshot": 0.12, "boost": 0.45, "mlp": 0.35}
 ORDER = ["baseline", "oneshot", "linear", "boost", "mlp"]
 
@@ -105,11 +115,18 @@ class Trained:
         preds = [w * l.predict(X) for l, w in zip(self.learners, self.weights)]
         return sum(preds)
 
-    def predict(self, rows: list) -> list[dict]:
-        """Predictions for rows given as dicts {column: value} or lists in the training column order."""
-        if not rows:
+    def predict(self, rows) -> list[dict]:
+        """Predictions for rows given as dicts {column: value}, lists in the training column order, or a Table."""
+        if isinstance(rows, Table):
+            t = rows
+            rows = Table([c for c in self.encoder.columns], [t.col(c) if c in t.columns else np.full(t.n, "", dtype=object) for c in self.encoder.columns])
+            if not rows.n:
+                return []
+            X = self.encoder.transform(rows)
+        elif not rows:
             return []
-        X = self.encoder.transform(self._rows(rows))
+        else:
+            X = self.encoder.transform(self._rows(rows))
         p = self.predict_x(X)
         if self.task.kind == "classification":
             out = []
@@ -131,7 +148,7 @@ class Trained:
             m, a = l.state()
             lmeta.append({"kind": l.key, "cls": type(l).__name__, "meta": m})
             arrays |= {f"l{i}.{k}": v for k, v in a.items()}
-        np.savez_compressed(folder / "weights.npz", **arrays)
+        np.savez(folder / "weights.npz", **arrays)
         meta = {"format": 1, "type": "table", "task": vars(self.task), "target": self.target, "labels": self.labels, "y_mu": self.y_mu, "y_sd": self.y_sd,
                 "encoder": enc_meta, "learners": lmeta, "weights": self.weights, "report": self.report}
         (folder / "model.json").write_text(json.dumps(meta, indent=1, default=_json_default))
@@ -161,58 +178,77 @@ def _json_default(o):
 
 
 # ------------------------------------------------------------------ training
-def prepare_target(columns, rows, target: str | None, task: str = "auto"):
-    prof = profile(columns, rows)
+def prepare_target(table, rows=None, target: str | None = None, task: str = "auto"):
+    """(profile, target, task kind, table of rows that have a target, y, class labels, mean, sd)."""
+    if not isinstance(table, Table):
+        table = Table.from_rows(table, rows or [])
+    prof = profile(table)
     by = {p["name"]: p for p in prof}
     target = target or pick_target(prof)
     if target not in by:
-        raise DataError(f"There is no column called '{target}'. Columns: {', '.join(columns)}")
+        raise DataError(f"There is no column called '{target}'. Columns: {', '.join(table.columns)}")
     tp = by[target]
     if tp["kind"] in ("empty", "constant"):
         raise DataError(f"The column '{target}' {tp.get('why', 'cannot be predicted')}, so there is nothing to learn.")
     kind = pick_task(tp) if task == "auto" else task
-    j = columns.index(target)
-    keep = [i for i, r in enumerate(rows) if not is_missing(r[j]) and (kind == "classification" or to_float(r[j]) is not None)]
-    if len(keep) < 10:
-        raise DataError(f"Only {len(keep)} rows have a value in '{target}'. At least 10 are needed to learn anything.")
-    rows = [rows[i] for i in keep]
+    col = table.col(target)
+    f = to_floats(col) if kind == "regression" else None
+    keep = ~np.isnan(f) if f is not None else ~missing_mask(col)
+    if keep.sum() < 10:
+        raise DataError(f"Only {int(keep.sum())} rows have a value in '{target}'. At least 10 are needed to learn anything.")
+    if not keep.all():
+        idx = np.flatnonzero(keep)
+        table, col = table.take(idx), col[idx]
+        f = f[idx] if f is not None else None
     if kind == "classification":
-        vals = [r[j].strip() for r in rows]
-        uniq = sorted(set(vals), key=lambda v: (to_float(v) is None, to_float(v) or 0, v))
+        vals = col.tolist()
+        label_of = {v: cell_str(v).strip() for v in set(vals)}
+        uniq = sorted(set(label_of.values()), key=lambda v: (to_float(v) is None, to_float(v) or 0, v))
         if len(uniq) < 2:
             raise DataError(f"Every row has the same '{target}' ({uniq[0]}), so there is nothing to learn.")
         if len(uniq) > 200:
             raise DataError(f"'{target}' has {len(uniq)} different values — too many classes. If it is a number, train it as regression.")
         pos = {v: i for i, v in enumerate(uniq)}
-        y = np.array([pos[v] for v in vals], np.int64)
-        return prof, target, kind, rows, y, uniq, 0.0, 1.0
-    yv = np.array([to_float(r[j]) for r in rows], np.float64)
-    mu, sd = float(yv.mean()), float(yv.std() or 1.0)
-    return prof, target, kind, rows, ((yv - mu) / sd).astype(np.float32), [], mu, sd
+        code = {v: pos[label_of[v]] for v in label_of}
+        y = np.fromiter(map(code.__getitem__, vals), np.int64, count=len(vals))
+        return prof, target, kind, table, y, uniq, 0.0, 1.0
+    mu, sd = float(f.mean()), float(f.std() or 1.0)
+    return prof, target, kind, table, ((f - mu) / sd).astype(np.float32), [], mu, sd
 
 
-def train_table(columns: list[str], rows: list[list[str]], target: str | None = None, task: str = "auto", ignore=(),
-                budget: float = 30.0, learners: list[str] | None = None, seed: int = 0, progress=None, stop=None) -> Trained:
-    """Learn to predict `target` from the other columns. `progress(event: dict)` is told what happens as it happens."""
+def train_table(columns, rows=None, target: str | None = None, task: str = "auto", ignore=(),
+                budget: float = 30.0, learners: list[str] | None = None, seed: int = 0, progress=None, stop=None,
+                deadline: float | None = None) -> Trained:
+    """Learn to predict `target` from the other columns. `columns` may be a Table (then `rows` is None).
+
+    Everything, from reading the columns to the final score, is fitted into `budget` seconds (or until the
+    absolute `deadline`, a time.perf_counter() value). `progress(event: dict)` hears what happens as it happens."""
     t_start = time.perf_counter()
+    deadline = deadline if deadline is not None else t_start + budget
+    total_budget = max(0.05, deadline - t_start)
+    reserve = min(0.12 * total_budget, 20.0)          # kept for choosing the winner, importance and saving
     emit = progress or (lambda e: None)
     say = lambda text, **kw: emit({"type": "stage", "text": text, "t": round(time.perf_counter() - t_start, 3), **kw})
+    table = columns if isinstance(columns, Table) else Table.from_rows(columns, rows or [])
+    columns = table.columns
     say("Reading the columns…")
-    prof, target, kind, rows, y, labels, y_mu, y_sd = prepare_target(columns, rows, target, task)
+    prof, target, kind, table, y, labels, y_mu, y_sd = prepare_target(table, None, target, task)
     T = Task(kind, len(labels) if kind == "classification" else 1)
     kinds = {p["name"]: p["kind"] for p in prof if p["name"] != target and p["name"] not in set(ignore)}
-    tr, va, te = split_rows(len(rows), y if kind == "classification" else None, seed)
-    say(f"Split {len(rows):,} rows: {len(tr):,} to learn from, {len(va):,} to check progress, {len(te):,} kept back for the final test.",
+    n = table.n
+    tr, va, te = split_rows(n, y if kind == "classification" else None, seed)
+    sample_note = f" (a random sample of about {table.total_rows:,})" if table.sampled else ""
+    say(f"Split {n:,} rows{sample_note}: {len(tr):,} to learn from, {len(va):,} to check progress, {len(te):,} kept back for the final test.",
         split={"train": len(tr), "valid": len(va), "test": len(te)}, task=kind, target=target, classes=len(labels))
-    enc = Encoder(columns, kinds).fit([rows[i] for i in tr])
-    Xtr, Xva, Xte = (enc.transform([rows[i] for i in part]) for part in (tr, va, te))
+    enc = Encoder(columns, kinds).fit(table.take(tr))
+    Xtr, Xva, Xte = (enc.transform(table.take(part)) for part in (tr, va, te))
     ytr, yva, yte = y[tr], y[va], y[te]
     used = sorted(set(enc.owner) | {s["col"] for s in enc.spec if s["kind"] == "text"}, key=columns.index)
     n_text = sum(s["kind"] == "text" for s in enc.spec)
     nd = Xtr.dense.shape[1]
     words = f"words from {n_text} text column{'s' * (n_text > 1)}" if n_text else ""
     say((f"Turned {len(used) - n_text} column{'s' * (len(used) - n_text != 1)} into {nd:,} number{'s' * (nd != 1)} per row" + (f", plus {words}" if words else "") if nd
-         else f"Turned {words} into word features") + ".",
+         else f"Turned {words} into word features") + f" ({time.perf_counter() - t_start:.2f} s so far).",
         features=Xtr.dense.shape[1], text_columns=n_text, columns=used)
 
     wanted = [k for k in ORDER if k in (learners or ORDER) or k == "baseline"]
@@ -224,22 +260,27 @@ def train_table(columns: list[str], rows: list[list[str]], target: str | None = 
     emit({"type": "plan", "learners": [{"learner": l.key, "label": l.label, "blurb": l.blurb} for l in pool]})
     board, fitted = [], []
     t_models = time.perf_counter()
+    learn_until = deadline - reserve
     shares = dict(SHARES, linear=0.5) if Xtr.has_text else SHARES     # only the linear model reads text, so give it time
     for i, l in enumerate(pool):
         if stop is not None and stop.is_set():
             break
-        left = budget - (time.perf_counter() - t_start)
+        have_model = any(f[0].key != "baseline" for f in fitted)
+        if have_model and time.perf_counter() >= learn_until:
+            emit({"type": "learner_skipped", "learner": l.key, "label": l.label, "why": "out of time"})
+            continue
+        left = max(0.0, learn_until - time.perf_counter())
         rest = sum(shares.get(p.key, 0) for p in pool[i:]) or 1
-        share = shares.get(l.key, 0) / rest
-        deadline = time.perf_counter() + max(0.5, left * share)
-        emit({"type": "learner_start", "learner": l.key, "label": l.label, "blurb": l.blurb, "seconds": round(max(0.5, left * share), 1)})
+        give = max(0.02, left * shares.get(l.key, 0) / rest)
+        l_deadline = time.perf_counter() + give
+        emit({"type": "learner_start", "learner": l.key, "label": l.label, "blurb": l.blurb, "seconds": round(give, 2)})
         t0 = time.perf_counter()
 
         def report(step, total, val=None, train_loss=None, note=None, _k=l.key, _t0=t0):
             emit({"type": "progress", "learner": _k, "step": step, "total": total, "val": val, "train_loss": train_loss, "note": note,
                   "t": round(time.perf_counter() - _t0, 3)})
         try:
-            l.fit(Xtr, ytr, Xva, yva, T, deadline, report, stop)
+            l.fit(Xtr, ytr, Xva, yva, T, l_deadline, report, stop)
         except Exception as e:  # one learner failing must not lose the others
             emit({"type": "learner_failed", "learner": l.key, "error": str(e)})
             continue
@@ -273,36 +314,40 @@ def train_table(columns: list[str], rows: list[list[str]], target: str | None = 
     model = Trained(T, target, labels, y_mu, y_sd, enc, [f[0] for f in choice], weights)
     name = " + ".join(f[0].label for f in choice)
     say(f"Winner: {name}. Measuring which columns it relies on…")
-    importance = permutation_importance(model, Xva, yva, enc, used)
+    importance = permutation_importance(model, Xva, yva, enc, used, until=deadline - 0.02 * total_budget)
     total = time.perf_counter() - t_start
     model.report = {
-        "target": target, "task": T.kind, "classes": labels, "rows": len(rows), "split": {"train": len(tr), "valid": len(va), "test": len(te)},
+        "target": target, "task": T.kind, "classes": labels, "rows": n, "file_rows": table.total_rows, "rows_exact": table.exact, "sampled": table.sampled,
+        "split": {"train": len(tr), "valid": len(va), "test": len(te)},
         "features": Xtr.dense.shape[1], "text_columns": n_text, "columns_used": used, "ignored": [{"name": p["name"], "why": p.get("why", "ignored by you")} for p in prof
                                                                   if p["name"] != target and (p["name"] not in kinds or kinds[p["name"]] not in ("number", "category", "text", "date"))],
         "profile": prof, "leaderboard": board, "winner": [f[0].key for f in choice], "winner_label": name,
         "valid": choice_m, "test": test_m, "baseline_test": base["test"] if base else None, "importance": importance,
-        "seconds_total": round(total, 3), "seconds_learning": round(time.perf_counter() - t_models, 3), "budget": budget,
+        "seconds_total": round(total, 3), "seconds_learning": round(time.perf_counter() - t_models, 3), "budget": round(total_budget, 3),
         "first_model_seconds": next((r["seconds"] for r in board if r["learner"] != "baseline"), None),
     }
     emit({"type": "done", "report": model.report})
     return model
 
 
-def permutation_importance(model: Trained, X: XData, y: np.ndarray, enc: Encoder, columns: list[str], seed: int = 0) -> list[dict]:
-    """How much the validation score drops when one column's values are shuffled between rows."""
+def permutation_importance(model: Trained, X: XData, y: np.ndarray, enc: Encoder, columns: list[str], seed: int = 0,
+                           until: float | None = None) -> list[dict]:
+    """How much the validation score drops when one column's values are shuffled between rows (stops at `until`)."""
     if X.n < 5:
         return []
     rng = np.random.default_rng(seed)
     T = model.task
-    if X.n > 3000:
-        X = X.take(np.arange(3000))
-        y = y[:3000]
+    if X.n > 2000:
+        X = X.take(np.arange(2000))
+        y = y[:2000]
     base = model.predict_x(X)
     loss = (lambda p: log_loss(p, y)) if T.kind == "classification" else (lambda p: float(((p - y) ** 2).mean()))
     b = loss(base)
     slices = enc.column_slices()
     out = []
     for c in columns[:80]:
+        if until is not None and time.perf_counter() > until:
+            break
         perm = rng.permutation(X.n)
         if c in slices:
             d = X.dense.copy()
