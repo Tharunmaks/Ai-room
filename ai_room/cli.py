@@ -5,6 +5,8 @@
     ai-room library fetch astronomy history         # download textbooks (Wikipedia, Wikibooks)
     ai-room library import history ./books          # your own txt/md/html/pdf/epub/docx files
     ai-room bank import questions.jsonl --subject biology
+    ai-room lab train data.csv --target price          # an untrained model learns your table in seconds
+    ai-room lab predict <model> new_rows.csv
 """
 
 from __future__ import annotations
@@ -166,7 +168,17 @@ def main(argv: list[str] | None = None) -> None:
     q.add_argument("model_dir", help="e.g. data/trained/model/merged")
     q.add_argument("question")
 
+    try:
+        from .lab.cli import add_parser as add_lab
+        add_lab(sub)
+    except ImportError:   # the Lab needs NumPy; the rest of the CLI does not
+        pass
+
     a = p.parse_args(argv)
+    if a.cmd == "lab":
+        from .lab.cli import run as run_lab
+        run_lab(a)
+        return
 
     if a.cmd == "train":
         from .train_cpu import TrainConfig, parse_grades, train

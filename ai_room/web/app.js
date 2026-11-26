@@ -2,12 +2,12 @@
 /* AI Room — the application: state, views, live class feed and the setup wizard. */
 let META = null;
 const S = {
-  rooms: [], id: null, room: null, view: store.get("view", "classroom"), feed: [], lastId: 0, es: null, renderer: null,
+  rooms: [], id: null, room: null, view: store.get("view", "lab"), feed: [], lastId: 0, es: null, renderer: null,
   notebook: null, lib: null, job: null, jobTimer: null, libSubjects: "room", dirty: null, chatTo: "student", nbFilter: { subject: "all", kind: "all", q: "" },
   teacherDraft: null, previewSubject: "physics", previewGrade: 5,
 };
 const VIEWS = [
-  ["classroom", "Classroom", "classroom"], ["subjects", "Subjects", "subjects"], ["teacher", "Teacher", "teacher"],
+  ["lab", "Lab", "flask"], ["classroom", "Classroom", "classroom"], ["subjects", "Subjects", "subjects"], ["teacher", "Teacher", "teacher"],
   ["workshop", "Workshop", "tools"], ["library", "Library", "library"], ["notebook", "Notebook", "notebook"], ["report", "Report", "report"],
 ];
 const SUBJ = (k) => META.subjects.find((s) => s.key === k);
@@ -93,6 +93,7 @@ function render() {
   const page = $("#page");
   if (S.view === "workshop") { page.innerHTML = `<div class="view" id="ws"></div>`; renderWorkshop(); return; }
   if (S.view === "library") { page.innerHTML = `<div class="view" id="lib"></div>`; renderLibrary(); return; }
+  if (S.view === "lab") { page.innerHTML = `<div class="view" id="lab"></div>`; renderLab(); return; }
   if (!S.room) { page.innerHTML = `<div class="view">${welcomeHTML()}</div>`; return; }
   const fn = { classroom: renderClassroom, subjects: renderSubjects, teacher: renderTeacher, notebook: renderNotebook, report: renderReport }[S.view];
   page.innerHTML = `<div class="view" id="view"></div>`; fn($("#view"));

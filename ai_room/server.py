@@ -439,6 +439,15 @@ def create_app(db_path: str | None = None, library_path: str | None = None, llm_
 
     from .workshop_api import mount as mount_workshop
     mount_workshop(app, None if db == ":memory:" else (os.path.dirname(db) or "."), workspace, workshop_llm_factory)
+    try:
+        from .lab.api import mount as mount_lab
+        mount_lab(app, None if db == ":memory:" else (os.path.dirname(db) or "."))
+    except ImportError as e:   # the Lab needs NumPy; everything else works without it
+        missing_lab = str(e)
+
+        @app.get("/api/lab/info")
+        def lab_unavailable():
+            raise HTTPException(503, f"The Lab needs NumPy: pip install numpy ({missing_lab})")
 
     app.mount("/static", StaticFiles(directory=WEB), name="static")
     return app
