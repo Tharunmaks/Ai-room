@@ -20,6 +20,10 @@ SAMPLES = {
               "about": "3,000 made-up customers with sign-up dates, plans and support calls. Predict who will leave."},
     "shapes": {"title": "Shapes (pictures)", "icon": "🔺", "kind": "images",
                "about": "600 small drawings of circles, squares and triangles in a zip of folders. Learn to tell them apart."},
+    "sounds": {"title": "Sounds (audio)", "icon": "🔊", "kind": "sounds",
+               "about": "400 short WAV clips of whistles, drums, chords and bird-like chirps in a zip of folders. Learn to tell them apart by ear."},
+    "motions": {"title": "Motions (video)", "icon": "🎬", "kind": "videos",
+                "about": "320 tiny animated clips: a ball bouncing or sliding, a bar spinning, a circle growing. Learn the movement, not the colour."},
     "code": {"title": "Python code", "icon": "🐍", "kind": "text",
              "about": "AI Room's own source code (about 1 MB). The model learns to write text that looks like it."},
 }
@@ -142,6 +146,91 @@ def shapes(per_class: int = 200, size: int = 48, seed: int = 9) -> bytes:
     return buf.getvalue()
 
 
+def sounds(per_class: int = 100, seconds: float = 0.6, rate: int = 8000, seed: int = 13) -> bytes:
+    """A zip with whistles/, drums/, chords/ and chirps/ folders of short WAV clips (random pitch, loudness, noise)."""
+    import wave
+    import zipfile
+    rng = np.random.default_rng(seed)
+    n = int(seconds * rate)
+    t = np.arange(n) / rate
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for kind in ("whistles", "drums", "chords", "chirps"):
+            for i in range(per_class):
+                f0 = rng.uniform(220, 1100)
+                start = rng.uniform(0, 0.15)
+                on = np.clip((t - start) * 40, 0, 1)
+                if kind == "whistles":       # one pure note with a little vibrato
+                    x = np.sin(2 * np.pi * f0 * t + rng.uniform(2, 6) * np.sin(2 * np.pi * rng.uniform(4, 7) * t)) * on
+                elif kind == "drums":        # noisy hits that die away quickly
+                    x = np.zeros(n)
+                    for hit in np.arange(start, seconds, rng.uniform(0.12, 0.3)):
+                        k = int(hit * rate)
+                        m = n - k
+                        x[k:] += rng.normal(0, 1, m) * np.exp(-np.arange(m) / rate * rng.uniform(25, 60)) \
+                            + np.sin(2 * np.pi * rng.uniform(60, 140) * np.arange(m) / rate) * np.exp(-np.arange(m) / rate * 18)
+                elif kind == "chords":       # three notes together, each with overtones
+                    x = sum(sum(np.sin(2 * np.pi * f0 * r * h * t) / h for h in (1, 2, 3)) for r in (1, 1.26, 1.5)) * on * np.exp(-t * rng.uniform(0.5, 2))
+                else:                        # quick rising sweeps, repeated
+                    x = np.zeros(n)
+                    period = rng.uniform(0.08, 0.18)
+                    phase = (t - start) % period
+                    sweep = (phase < period * 0.6) * (t > start)
+                    f = f0 * 2 + 3000 * phase / period
+                    x = np.sin(2 * np.pi * np.cumsum(f) / rate) * sweep
+                x = x / (np.abs(x).max() + 1e-9) * rng.uniform(0.2, 0.9) + rng.normal(0, rng.uniform(0.005, 0.05), n)
+                pcm = (np.clip(x, -1, 1) * 32767).astype("<i2").tobytes()
+                out = io.BytesIO()
+                with wave.open(out, "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(rate)
+                    w.writeframes(pcm)
+                z.writestr(f"sounds/{kind}/{kind[:-1]}_{i:03d}.wav", out.getvalue())
+    return buf.getvalue()
+
+
+def motions(per_class: int = 80, size: int = 40, frames: int = 10, seed: int = 17) -> bytes:
+    """A zip with bouncing/, sliding/, spinning/ and growing/ folders of small animated GIFs."""
+    import zipfile
+    from PIL import Image, ImageDraw
+    rng = np.random.default_rng(seed)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+        for kind in ("bouncing", "sliding", "spinning", "growing"):
+            for i in range(per_class):
+                bg = tuple(int(v) for v in rng.integers(0, 120, 3))
+                fg = tuple(int(v) for v in rng.integers(140, 256, 3))
+                r = rng.uniform(size * 0.08, size * 0.16)
+                cx, cy = rng.uniform(size * 0.3, size * 0.7, 2)
+                speed = rng.uniform(0.6, 1.4)
+                a0 = rng.uniform(0, 2 * np.pi)
+                pics = []
+                for f in range(frames):
+                    img = Image.new("RGB", (size, size), bg)
+                    d = ImageDraw.Draw(img)
+                    s = np.sin(2 * np.pi * speed * f / frames + a0)
+                    if kind == "bouncing":
+                        y = cy + s * size * 0.3
+                        d.ellipse([cx - r, y - r, cx + r, y + r], fill=fg)
+                    elif kind == "sliding":
+                        x = cx + s * size * 0.3
+                        d.ellipse([x - r, cy - r, x + r, cy + r], fill=fg)
+                    elif kind == "spinning":
+                        a = a0 + 2 * np.pi * speed * f / frames
+                        L = size * 0.3
+                        d.line([cx - L * np.cos(a), cy - L * np.sin(a), cx + L * np.cos(a), cy + L * np.sin(a)], fill=fg, width=max(2, int(r * 0.7)))
+                    else:
+                        rr = r * (1.6 + 1.2 * s)
+                        d.ellipse([cx - rr, cy - rr, cx + rr, cy + rr], fill=fg)
+                    arr = np.asarray(img, np.int16) + rng.normal(0, 8, (size, size, 3)).astype(np.int16)
+                    pics.append(Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8)).quantize(32))
+                out = io.BytesIO()
+                pics[0].save(out, "GIF", save_all=True, append_images=pics[1:], duration=80, loop=0)
+                z.writestr(f"motions/{kind}/{kind}_{i:03d}.gif", out.getvalue())
+    return buf.getvalue()
+
+
 def code() -> bytes:
     root = Path(__file__).resolve().parent.parent
     parts = []
@@ -162,6 +251,10 @@ def make(name: str) -> tuple[str, bytes]:
         return "customer_churn.csv", churn()
     if name == "shapes":
         return "shapes.zip", shapes()
+    if name == "sounds":
+        return "sounds.zip", sounds()
+    if name == "motions":
+        return "motions.zip", motions()
     if name == "code":
         return "ai_room_code.txt", code()
     raise KeyError(name)

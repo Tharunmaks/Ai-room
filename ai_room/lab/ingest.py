@@ -74,15 +74,18 @@ def human(n: float) -> str:
 
 # ------------------------------------------------------------------ first look
 def sniff_path(path: Path, filename: str) -> str:
-    """'table', 'text' or 'images', looking only at the start of the file (or a zip's list of names)."""
-    from .data import IMAGE_EXT, TEXT_EXT, TABLE_EXT, sniff_kind
+    """'table', 'text', 'images', 'sounds' or 'videos', looking only at the start of the file (or a zip's list of names)."""
+    from .data import TEXT_EXT, TABLE_EXT, sniff_kind
     if ext_of(filename) == ".zip":
+        from .media import sniff_zip
         try:
-            names = [n for n in zipfile.ZipFile(path).namelist() if not n.endswith("/")]
+            z = zipfile.ZipFile(path)
         except zipfile.BadZipFile:
             raise DataError("That .zip file is damaged or not really a zip.")
-        if sum(ext_of(n) in IMAGE_EXT for n in names) >= max(2, len(names) // 2):
-            return "images"
+        media = sniff_zip(z)                        # pictures, sounds or videos in folders
+        if media:
+            return media
+        names = [n for n in z.namelist() if not n.endswith("/")]
         if any(ext_of(n) in TABLE_EXT for n in names) and not any(ext_of(n) in TEXT_EXT for n in names):
             return "table"
         return "text"

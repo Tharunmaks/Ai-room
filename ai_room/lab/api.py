@@ -21,10 +21,10 @@ from pydantic import BaseModel
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
-from . import samples
-from .automl import RATE_LABEL, SECONDS_PER_MB, SPEED_LABELS, SPEEDS, Trained, budget_for, new_id, train_table
+from . import media as mediamod, samples
+from .automl import MIN_SECONDS, RATE_LABEL, SECONDS_PER_MB, SPEED_LABELS, SPEEDS, Trained, budget_for, new_id, train_table
 from .data import IMAGE_EXT, DataError, Table, ext_of, pick_target, pick_task, profile, read_table, read_text
-from .images import contact_sheet, describe_zip, image_table, load_image_zip
+from .images import describe_zip, load_image_zip
 from .ingest import DOC_EXT, head_text, human, inspect_table, load_table, load_text, max_cells, sniff_path
 from .textgen import MAX_CHARS, TextModel, train_text
 
@@ -38,7 +38,7 @@ class TrainBody(BaseModel):
     target: str | None = None
     task: str = "auto"                 # auto | classification | regression
     ignore: list[str] = []
-    speed: str = "fast"                # fast = 10 min per GB | balanced | thorough
+    speed: str = "fast"                # fast = 5 min per GB | balanced | thorough
     name: str | None = None
 
 
@@ -53,6 +53,13 @@ class PredictBody(BaseModel):
     temperature: float = 0.8
     seed: int | None = None
     query: str | None = None           # text models: find passages
+
+
+def media_of(m) -> str | None:
+    """'image', 'audio' or 'video' for a model trained on a zip of folders, else None."""
+    if isinstance(m, TextModel):
+        return None
+    return m.report.get("media") or ("image" if m.report.get("image") else None)
 
 
 def _check_id(x: str) -> str:
@@ -92,9 +99,12 @@ def mount(app: FastAPI, data_dir: str | None) -> dict:
     def analyse(folder: Path, filename: str, size: int, sample: str | None = None) -> dict:
         """Describe a stored upload by reading only as much of it as needed."""
         path = folder / ("data" + (ext_of(filename) or ".bin"))
-        if ext_of(filename) in IMAGE_EXT:
-            raise DataError("To teach it pictures, upload a .zip with one folder per category — for example cats/ and dogs/ — "
-                            "with the pictures inside. (To ask a trained picture model about one picture, open the model and use “Try it”.)")
+        ext = ext_of(filename)
+        if ext in IMAGE_EXT or ext in mediamod.AUDIO_EXT or ext in mediamod.VIDEO_EXT:
+            what = "pictures" if ext in IMAGE_EXT else "sounds" if ext in mediamod.AUDIO_EXT else "videos"
+            eg = {"pictures": "cats/ and dogs/", "sounds": "barks/ and meows/", "videos": "jumping/ and walking/"}[what]
+            raise DataError(f"To teach it {what}, upload a .zip with one folder per category — for example {eg} — "
+                            f"with the {what} inside. (To ask a trained model about one file, open the model and use “Try it”.)")
         kind = sniff_path(path, filename)
         info = {"name": re.sub(r"\.[A-Za-z0-9]+$", "", filename) or filename, "filename": filename, "kind": kind, "bytes": size,
                 "created": time.time(), "sample": sample, "file": path.name, "id": folder.name}
@@ -114,11 +124,14 @@ def mount(app: FastAPI, data_dir: str | None) -> dict:
                 head, _ = head_text(path, 1 << 20)
                 info |= {"documents": 1, "titles": [info["name"]], "chars": size, "chars_exact": False, "preview_text": head[:1500]}
         elif kind == "images":
-            info |= describe_zip(path)
+            info |= describe_zip(path) | {"media": "image"}
+            info["target"], info["task"] = "category", "classification"
+        elif kind in ("sounds", "videos"):
+            info |= mediamod.describe(path, mediamod.MEDIA_OF[kind])
             info["target"], info["task"] = "category", "classification"
         else:
             raise DataError("That kind of file cannot be learned yet. Upload a table (CSV, Excel, TSV, JSON), text (txt, md, html, pdf, docx, epub) "
-                            "or a .zip of pictures with one folder per category.")
+                            "or a .zip with one folder per category of pictures, sounds or videos.")
         info["budget_seconds"] = round(budget_for("fast", size), 2)
         (folder / "info.json").write_text(json.dumps(info))
         return info
@@ -141,16 +154,17 @@ def mount(app: FastAPI, data_dir: str | None) -> dict:
 
     def brief(info: dict) -> dict:
         return {k: info.get(k) for k in ("id", "name", "filename", "kind", "bytes", "rows", "rows_exact", "columns", "target", "task", "documents", "chars",
-                                         "chars_exact", "created", "sample", "budget_seconds", "images", "classes")}
+                                         "chars_exact", "created", "sample", "budget_seconds", "images", "items", "classes", "media")}
 
     @app.get("/api/lab/info")
     def lab_info():
         import numpy
         free = shutil.disk_usage(ds_dir).free
         return {"speeds": [{"key": k, "label": SPEED_LABELS[k], "seconds": s} for k, s in SPEEDS.items()], "seconds_per_mb": SECONDS_PER_MB,
-                "rate_label": RATE_LABEL,
+                "rate_label": RATE_LABEL, "min_seconds": MIN_SECONDS,
                 "max_bytes": MAX_BYTES, "max_label": human(MAX_BYTES), "disk_free": free, "disk_free_label": human(free),
-                "cpus": os.cpu_count(), "numpy": numpy.__version__, "memory_cells": max_cells(),
+                "cpus": os.cpu_count(), "numpy": numpy.__version__, "memory_cells": max_cells(), "ffmpeg": bool(mediamod.ffmpeg()),
+                "audio_ext": sorted(mediamod.AUDIO_EXT), "video_ext": sorted(mediamod.VIDEO_EXT), "image_ext": sorted(IMAGE_EXT),
                 "samples": [{"key": k, **v} for k, v in samples.SAMPLES.items()], "busy": sum(j["status"] in ("queued", "running") for j in jobs.values())}
 
     @app.post("/api/lab/datasets")
@@ -200,11 +214,11 @@ def mount(app: FastAPI, data_dir: str | None) -> dict:
     @app.get("/api/lab/datasets/{did}/preview.png")
     def dataset_preview(did: str):
         info = dataset_info(did)
-        if info["kind"] != "images":
-            raise HTTPException(404, "only picture datasets have a preview sheet")
+        if info["kind"] not in mediamod.MEDIA_OF:
+            raise HTTPException(404, "only picture, sound and video datasets have a preview sheet")
         out = ds_dir / did / "preview.png"
         if not out.exists():
-            out.write_bytes(contact_sheet(path_of(info)))
+            out.write_bytes(mediamod.preview_sheet(path_of(info), mediamod.MEDIA_OF[info["kind"]]))
         return FileResponse(out, media_type="image/png")
 
     @app.delete("/api/lab/datasets/{did}")
@@ -234,7 +248,7 @@ def mount(app: FastAPI, data_dir: str | None) -> dict:
             deadline = t0 + budget
             mid = new_id()
             folder = model_dir / mid
-            say(f"Time allowed: {budget:.1f} s ({RATE_LABEL} of data, for this {human(info['bytes'])} file" + ("; at least 1 s" if budget <= 1.0 else "") + ").")
+            say(f"Time allowed: {budget:.1f} s ({RATE_LABEL} of data, for this {human(info['bytes'])} file" + (f"; at least {MIN_SECONDS:g} s" if budget <= MIN_SECONDS else "") + ").")
             if info["kind"] == "text":
                 docs, tinfo = load_text(path, info["filename"], MAX_CHARS, say=say)
                 model = train_text(docs, progress=progress, stop=stop, deadline=deadline - 0.12 * budget)
@@ -242,6 +256,12 @@ def mount(app: FastAPI, data_dir: str | None) -> dict:
                 table = load_image_zip(path, deadline=t0 + 0.45 * budget, say=say)
                 model = train_table(table, None, "category", task="classification", progress=progress, stop=stop,
                                     deadline=deadline - 0.03 * budget, image=True)
+            elif info["kind"] in ("sounds", "videos"):
+                kind = mediamod.MEDIA_OF[info["kind"]]
+                say(f"Listening to the {mediamod.NOUN[kind]}…" if kind == "audio" else f"Watching the {mediamod.NOUN[kind]}…")
+                table = mediamod.load_zip(path, kind, deadline=t0 + 0.55 * budget, say=say)
+                model = train_table(table, None, "category", task="classification", progress=progress, stop=stop,
+                                    deadline=deadline - 0.03 * budget, image=kind)
             else:
                 table = load_table(path, info["filename"], say=say)
                 model = train_table(table, None, job["target"], task=job["task"], ignore=job["ignore"], progress=progress, stop=stop,
@@ -429,21 +449,30 @@ def mount(app: FastAPI, data_dir: str | None) -> dict:
         preds = m.predict(body.rows)
         return {"predictions": preds, "seconds": round(time.perf_counter() - t, 4)}
 
-    @app.post("/api/lab/models/{mid}/predict_image")
-    async def predict_image(mid: str, request: Request):
-        """The picture is the request body; the reply is the category with the model's confidence in each."""
+    @app.post("/api/lab/models/{mid}/predict_media")
+    async def predict_media(mid: str, request: Request, filename: str = ""):
+        """One picture, sound or video is the request body (its name, for the format, in ?filename=); the reply is the
+        category with the model's confidence in each."""
         m = load(mid)
-        if isinstance(m, TextModel) or not m.report.get("image"):
-            raise HTTPException(400, "This model was not trained on pictures.")
+        kind = media_of(m)
+        if not kind:
+            raise HTTPException(400, "This model was not trained on pictures, sounds or videos.")
         raw = await request.body()
-        if len(raw) > 64 << 20:
-            raise HTTPException(413, "Pictures up to 64 MB, please.")
+        if len(raw) > 512 << 20:
+            raise HTTPException(413, "Files up to 512 MB, please.")
+        name = os.path.basename(filename) or {"image": "picture.png", "audio": "sound.wav", "video": "clip.mp4"}[kind]
         try:
             t = time.perf_counter()
-            pred = m.predict(image_table([raw]))[0]
+            table = await run_in_threadpool(mediamod.media_table, kind, [(name, raw)])
+            pred = m.predict(table)[0]
         except DataError as e:
             raise HTTPException(400, str(e))
-        return {"prediction": pred, "seconds": round(time.perf_counter() - t, 4)}
+        return {"prediction": pred, "seconds": round(time.perf_counter() - t, 4), "media": kind}
+
+    @app.post("/api/lab/models/{mid}/predict_image")
+    async def predict_image(mid: str, request: Request, filename: str = "picture.png"):
+        """Older name for predict_media."""
+        return await predict_media(mid, request, filename)
 
     @app.post("/api/lab/models/{mid}/predict_file")
     async def predict_file(mid: str, request: Request, filename: str = "rows.csv"):
@@ -451,8 +480,8 @@ def mount(app: FastAPI, data_dir: str | None) -> dict:
         m = load(mid)
         if isinstance(m, TextModel):
             raise HTTPException(400, "Text models write text; upload a table to a table model.")
-        if m.report.get("image") and ext_of(filename) != ".zip":
-            raise HTTPException(400, "For a picture model, upload a .zip of pictures; you get back a CSV with a category for each.")
+        if media_of(m) and ext_of(filename) != ".zip":
+            raise HTTPException(400, f"For a {media_of(m)} model, upload a .zip of {mediamod.NOUN[media_of(m)]}; you get back a CSV with a category for each.")
         import tempfile
         tmp = Path(tempfile.mkdtemp(prefix="lab_predict_", dir=base))
         src = tmp / ("in" + (ext_of(filename) or ".csv"))
@@ -485,8 +514,8 @@ def write_card(folder: Path, model, name: str, dataset: str | None = None, datas
     if isinstance(model, TextModel):
         card = {"type": "text", "summary": f"{report['chars']:,} characters, context {report['order']}",
                 "score": {"bits_per_char": report["valid_bits_per_char"], "random_bits_per_char": report["random_bits_per_char"]}}
-    elif report.get("image"):
-        card = {"type": "image", "task": "classification", "target": "category", "winner": report["winner_label"],
+    elif media_of(model):
+        card = {"type": media_of(model), "task": "classification", "target": "category", "winner": report["winner_label"],
                 "score": report["test"], "baseline": report["baseline_test"], "inputs": [], "classes": report["classes"]}
     else:
         card = {"type": "table", "task": report["task"], "target": report["target"], "winner": report["winner_label"],
@@ -535,13 +564,15 @@ def learning_curve(events: list[dict], per_learner: int = 120) -> dict:
     return out
 
 
-def predict_image_zip(model: Trained, src: Path, out: Path, chunk: int = 500) -> int:
-    """A CSV with the predicted category of every picture in a zip."""
+def predict_media_zip(model: Trained, src: Path, out: Path, chunk: int = 200) -> int:
+    """A CSV with the predicted category of every picture, sound or video in a zip."""
     import zipfile as zf
     import numpy as np
-    from .images import FEATURES, feature_names, features, open_image
+    kind = media_of(model)
     z = zf.ZipFile(src)
-    names = [n for n in z.namelist() if ext_of(n) in IMAGE_EXT and not n.endswith("/") and "__MACOSX" not in n]
+    exts = mediamod.exts_for(kind)
+    names = [n for n in z.namelist() if ext_of(n) in exts and not n.endswith("/") and "__MACOSX" not in n]
+    noun = {"image": "picture", "audio": "sound", "video": "video"}[kind]
     with open(out, "w", newline="", encoding="utf-8") as fo:
         w = csv.writer(fo)
         w.writerow(["file", "predicted category", "confidence"])
@@ -549,13 +580,14 @@ def predict_image_zip(model: Trained, src: Path, out: Path, chunk: int = 500) ->
             feats, ok = [], []
             for n in names[i:i + chunk]:
                 try:
-                    feats.append(features(open_image(z.read(n))))
+                    feats.append(mediamod.features_of(kind, z.read(n), n))
                     ok.append(n)
                 except DataError:
-                    w.writerow([n, "(not a readable picture)", ""])
+                    w.writerow([n, f"(not a readable {noun})", ""])
             if feats:
                 X = np.stack(feats).astype(np.float64)
-                table = Table(feature_names(), [X[:, j] for j in range(FEATURES)], len(feats))
+                cols = mediamod.names_for(kind)
+                table = Table(cols, [X[:, j] for j in range(X.shape[1])], len(feats))
                 for n, p in zip(ok, model.predict(table)):
                     w.writerow([n, p["prediction"], round(p["confidence"], 4)])
     return len(names)
@@ -564,8 +596,8 @@ def predict_image_zip(model: Trained, src: Path, out: Path, chunk: int = 500) ->
 def predict_table_file(model: Trained, src: Path, filename: str, out: Path, chunk: int = 50_000) -> int:
     """Predict every row of a table file, reading and writing it in pieces so any size fits in memory."""
     ext = ext_of(filename)
-    if model.report.get("image"):
-        return predict_image_zip(model, src, out)
+    if media_of(model):
+        return predict_media_zip(model, src, out)
     cls = model.task.kind == "classification"
     rows_done = 0
     with open(out, "w", newline="", encoding="utf-8") as fo:

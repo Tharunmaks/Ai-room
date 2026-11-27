@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import csv
 import io
+import os
 import json
 import math
 import re
@@ -80,15 +81,18 @@ def decode(raw: bytes) -> str:
 
 
 def sniff_kind(filename: str, raw: bytes) -> str:
-    """'table', 'text' or 'images' for an upload."""
+    """'table', 'text', 'images', 'sounds' or 'videos' for an upload."""
     ext = ext_of(filename)
     if ext == ".zip":
+        from .media import sniff_zip
         try:
-            names = [n for n in zipfile.ZipFile(io.BytesIO(raw)).namelist() if not n.endswith("/")]
+            z = zipfile.ZipFile(io.BytesIO(raw))
         except zipfile.BadZipFile:
             raise DataError("That .zip file is damaged or not really a zip.")
-        if sum(ext_of(n) in IMAGE_EXT for n in names) >= max(2, len(names) // 2):
-            return "images"
+        media = sniff_zip(z)                        # pictures, sounds or videos in folders
+        if media:
+            return media
+        names = [n for n in z.namelist() if not n.endswith("/")]
         if any(ext_of(n) in TABLE_EXT for n in names) and not any(ext_of(n) in TEXT_EXT for n in names):
             return "table"
         return "text"
@@ -458,8 +462,11 @@ class Encoder:
         self._memo: dict[str, int] = {}
 
     # -- fitting
-    def fit(self, rows) -> "Encoder":
+    def fit(self, rows, full: "Table | None" = None, subset=None) -> "Encoder":
+        """Fit on `rows`. With `full` (the whole table) and `subset` (which of its rows `rows` are), the words of every
+        row of `full` are found once, in parallel, and kept so transform(…, subset=…) does not look for them again."""
         t = rows if isinstance(rows, Table) else Table.from_rows(self.columns, rows)
+        self._cache = None
         self.spec, self.names, self.owner = [], [], []
         idx = {c: i for i, c in enumerate(self.columns)}
         n = t.n
@@ -505,8 +512,13 @@ class Encoder:
             elif kind == "text":
                 self.spec.append({"col": c, "j": j, "kind": "text", "salt": zlib.crc32(c.encode()) & 0xFFFF, "v": 2})
         if any(s["kind"] == "text" for s in self.spec):
-            u = _runs(np.sort(self._text_keys(t)))[0]                 # distinct (row, word) pairs
-            df = np.bincount((u % TEXT_DIM).astype(np.int64), minlength=TEXT_DIM).astype(np.float64)
+            if full is not None and subset is not None:
+                self._cache = self._word_rows(full)
+                _, cols, _ = self._cached(subset)
+            else:
+                u = _runs(np.sort(self._text_keys(t)))[0]                 # distinct (row, word) pairs
+                cols = (u % TEXT_DIM).astype(np.int64)
+            df = np.bincount(cols, minlength=TEXT_DIM).astype(np.float64)
             self.idf = (np.log((1 + n) / (1 + df)) + 1).astype(np.float32)
         if not self.spec:
             raise DataError("None of the columns can be used to learn from (they are all empty, constant, or IDs).")
@@ -522,6 +534,37 @@ class Encoder:
             return np.full((len(col), len(DATE_PARTS)), np.nan)
         table = {v: _date_parts(to_date(v)) for v in set(col.tolist())}
         return np.array([table[v] for v in col.tolist()], np.float64).reshape(len(col), len(DATE_PARTS))
+
+    def _word_rows(self, t: Table):
+        """(indptr, buckets, counts) of the distinct words of every row of `t`; big tables are split over the cores."""
+        from .parallel import can_fork, fork_map
+        n = t.n
+        if n >= 4000 and can_fork():
+            parts = max(2, min(8, os.cpu_count() or 2))
+            bounds = np.linspace(0, n, parts + 1).astype(np.int64)
+            pieces = fork_map(lambda a, b: _runs(np.sort(self._text_keys(t.take(np.arange(a, b)))))
+                              , list(zip(bounds[:-1], bounds[1:])))
+            us, cnts = [], []
+            for (a, _), (u, c) in zip(zip(bounds[:-1], bounds[1:]), pieces):
+                us.append(u + np.uint64(int(a)) * np.uint64(TEXT_DIM))
+                cnts.append(c)
+            u, cnt = np.concatenate(us), np.concatenate(cnts)
+        else:
+            u, cnt = _runs(np.sort(self._text_keys(t)))
+        rows = (u // TEXT_DIM).astype(np.int64)
+        indptr = np.concatenate([[0], np.cumsum(np.bincount(rows, minlength=n))]).astype(np.int64)
+        return indptr, (u % TEXT_DIM).astype(np.int64), cnt
+
+    def _cached(self, idx):
+        """(row in the subset, bucket, count) for the rows `idx` of the cached table, in the order of `idx`."""
+        indptr, cols, cnt = self._cache
+        idx = np.asarray(idx, np.int64)
+        starts, lens = indptr[idx], indptr[idx + 1] - indptr[idx]
+        pos = _ranges(starts, lens)
+        return np.repeat(np.arange(len(idx)), lens), cols[pos], cnt[pos]
+
+    def drop_cache(self) -> None:
+        self._cache = None
 
     def _text_keys(self, t: Table) -> np.ndarray:
         """row × TEXT_DIM + bucket for every word and word pair of every text column, computed a column at a time:
@@ -575,7 +618,7 @@ class Encoder:
             yield np.array(cols, np.int64)
 
     # -- transforming
-    def transform(self, rows) -> XData:
+    def transform(self, rows, subset=None) -> XData:
         t = rows if isinstance(rows, Table) else Table.from_rows(self.columns, rows)
         n = t.n
         blocks = []
@@ -609,8 +652,11 @@ class Encoder:
         if self.idf is None:
             return XData(dense)
         if all(s.get("v") == 2 for s in self.spec if s["kind"] == "text"):
-            u, cnt = _runs(np.sort(self._text_keys(t)))
-            rows, cols = (u // TEXT_DIM).astype(np.int64), (u % TEXT_DIM).astype(np.int64)
+            if subset is not None and getattr(self, "_cache", None) is not None:
+                rows, cols, cnt = self._cached(subset)
+            else:
+                u, cnt = _runs(np.sort(self._text_keys(t)))
+                rows, cols = (u // TEXT_DIM).astype(np.int64), (u % TEXT_DIM).astype(np.int64)
             w = (1 + np.log(cnt)) * self.idf[cols]
             norm = np.sqrt(np.bincount(rows, weights=w * w, minlength=n))
             w = (w / np.where(norm[rows] > 0, norm[rows], 1.0)).astype(np.float32)

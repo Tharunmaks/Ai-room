@@ -17,28 +17,31 @@ from pathlib import Path
 import numpy as np
 
 from .data import DataError, Encoder, Table, XData, cell_str, missing_mask, pick_target, pick_task, profile, to_float, to_floats
-from .learners import Baseline, Boosted, Learner, Neural, OneShot, Task, linear, log_loss
+from .learners import Baseline, Boosted, Learner, Neural, OneShot, Task, WordCounts, linear, log_loss
+from .parallel import can_fork, finished_predictions, race
 
-SECONDS_PER_GB = 600.0                       # 10 minutes per gigabyte
-SECONDS_PER_MB = SECONDS_PER_GB / 1000.0     # = 0.6 s per MB (1 GB = 1,000 MB = 10^9 bytes)
-RATE_LABEL = "10 min per GB"
-# fast: the whole job (reading, learning, testing, saving) gets 10 minutes per GB of data, at least 1 second.
+SECONDS_PER_GB = 300.0                       # 5 minutes per gigabyte
+SECONDS_PER_MB = SECONDS_PER_GB / 1000.0     # = 0.3 s per MB (1 GB = 1,000 MB = 10^9 bytes)
+MIN_SECONDS = 0.5                            # however small the file
+RATE_LABEL = "5 min per GB"
+# fast: the whole job (reading, learning, testing, saving) gets 5 minutes per GB of data, at least half a second.
+# The four learners run at the same time (one process each), so each of them has all of that time.
 # balanced / thorough: at least 30 s / 2 min, for more accuracy on small files (never less than the fast budget).
 SPEEDS = {"fast": 1.0, "balanced": 30.0, "thorough": 120.0}
 SPEED_LABELS = {"fast": RATE_LABEL, "balanced": "≈30 s", "thorough": "≈2 min"}
 
 
 def budget_for(speed: str, size_bytes: float) -> float:
-    """Seconds a training job may take: 10 minutes per GB (0.6 s per MB), at least SPEEDS[speed]."""
+    """Seconds a training job may take: 5 minutes per GB (0.3 s per MB), at least MIN_SECONDS (fast) or SPEEDS[speed]."""
     speed = "fast" if speed == "quick" else speed
-    per_mb = max(1.0, size_bytes / 1e6 * SECONDS_PER_MB)
+    per_mb = max(MIN_SECONDS, size_bytes / 1e6 * SECONDS_PER_MB)
     return per_mb if speed == "fast" else max(SPEEDS.get(speed, 30.0), per_mb)
-SHARES = {"linear": 0.08, "oneshot": 0.12, "boost": 0.45, "mlp": 0.35}
-ORDER = ["baseline", "oneshot", "linear", "boost", "mlp"]
+SHARES = {"linear": 0.08, "oneshot": 0.12, "words": 0.05, "boost": 0.45, "mlp": 0.35}
+ORDER = ["baseline", "oneshot", "words", "linear", "boost", "mlp"]
 
 
 def make_learner(key: str, seed: int = 0) -> Learner:
-    return {"baseline": Baseline, "oneshot": lambda: OneShot(seed=seed), "linear": linear,
+    return {"baseline": Baseline, "oneshot": lambda: OneShot(seed=seed), "linear": linear, "words": WordCounts,
             "boost": lambda: Boosted(seed=seed), "mlp": lambda: Neural(seed=seed)}[key]()
 
 
@@ -163,7 +166,7 @@ class Trained:
         with np.load(folder / "weights.npz", allow_pickle=False) as z:
             arrays = {k: z[k] for k in z.files}
         enc = Encoder.from_state(meta["encoder"], {k[4:]: v for k, v in arrays.items() if k.startswith("enc.")})
-        classes = {"Baseline": Baseline, "OneShot": OneShot, "Boosted": Boosted, "Neural": Neural}
+        classes = {"Baseline": Baseline, "OneShot": OneShot, "Boosted": Boosted, "Neural": Neural, "WordCounts": WordCounts}
         learners = []
         for i, lm in enumerate(meta["learners"]):
             pre = f"l{i}."
@@ -220,7 +223,7 @@ def prepare_target(table, rows=None, target: str | None = None, task: str = "aut
 
 def train_table(columns, rows=None, target: str | None = None, task: str = "auto", ignore=(),
                 budget: float = 30.0, learners: list[str] | None = None, seed: int = 0, progress=None, stop=None,
-                deadline: float | None = None, image: bool = False) -> Trained:
+                deadline: float | None = None, image: bool | str = False, parallel: bool = True) -> Trained:
     """Learn to predict `target` from the other columns. `columns` may be a Table (then `rows` is None).
 
     Everything, from reading the columns to the final score, is fitted into `budget` seconds (or until the
@@ -242,8 +245,9 @@ def train_table(columns, rows=None, target: str | None = None, task: str = "auto
     sample_note = f" (a random sample of about {table.total_rows:,})" if table.sampled else ""
     say(f"Split {n:,} rows{sample_note}: {len(tr):,} to learn from, {len(va):,} to check progress, {len(te):,} kept back for the final test.",
         split={"train": len(tr), "valid": len(va), "test": len(te)}, task=kind, target=target, classes=len(labels))
-    enc = Encoder(columns, kinds).fit(table.take(tr))
-    Xtr, Xva, Xte = (enc.transform(table.take(part)) for part in (tr, va, te))
+    enc = Encoder(columns, kinds).fit(table.take(tr), full=table, subset=tr)      # words found once for every row
+    Xtr, Xva, Xte = (enc.transform(table.take(part), subset=part) for part in (tr, va, te))
+    enc.drop_cache()
     ytr, yva, yte = y[tr], y[va], y[te]
     used = sorted(set(enc.owner) | {s["col"] for s in enc.spec if s["kind"] == "text"}, key=columns.index)
     n_text = sum(s["kind"] == "text" for s in enc.spec)
@@ -257,37 +261,14 @@ def train_table(columns, rows=None, target: str | None = None, task: str = "auto
     pool = []
     for k in wanted:
         l = make_learner(k, seed)
-        if l.usable(Xtr):
+        if l.usable(Xtr) and not (k == "words" and kind != "classification"):
             pool.append(l)
     emit({"type": "plan", "learners": [{"learner": l.key, "label": l.label, "blurb": l.blurb} for l in pool]})
     board, fitted = [], []
     t_models = time.perf_counter()
     learn_until = deadline - reserve
-    shares = dict(SHARES, linear=0.5) if Xtr.has_text else SHARES     # only the linear model reads text, so give it time
-    for i, l in enumerate(pool):
-        if stop is not None and stop.is_set():
-            break
-        have_model = any(f[0].key != "baseline" for f in fitted)
-        if have_model and time.perf_counter() >= learn_until:
-            emit({"type": "learner_skipped", "learner": l.key, "label": l.label, "why": "out of time"})
-            continue
-        left = max(0.0, learn_until - time.perf_counter())
-        rest = sum(shares.get(p.key, 0) for p in pool[i:]) or 1
-        give = max(0.02, left * shares.get(l.key, 0) / rest)
-        l_deadline = time.perf_counter() + give
-        emit({"type": "learner_start", "learner": l.key, "label": l.label, "blurb": l.blurb, "seconds": round(give, 2)})
-        t0 = time.perf_counter()
 
-        def report(step, total, val=None, train_loss=None, note=None, _k=l.key, _t0=t0):
-            emit({"type": "progress", "learner": _k, "step": step, "total": total, "val": val, "train_loss": train_loss, "note": note,
-                  "t": round(time.perf_counter() - _t0, 3)})
-        try:
-            l.fit(Xtr, ytr, Xva, yva, T, l_deadline, report, stop)
-        except Exception as e:  # one learner failing must not lose the others
-            emit({"type": "learner_failed", "learner": l.key, "error": str(e)})
-            continue
-        secs = time.perf_counter() - t0
-        pv, pt = l.predict(Xva), l.predict(Xte)
+    def finish(l, pv, pt, secs):
         mv, mt = metrics(T, pv, yva, y_mu, y_sd), metrics(T, pt, yte, y_mu, y_sd)
         row = {"learner": l.key, "label": l.label, "blurb": l.blurb, "seconds": round(secs, 3), "valid": mv, "test": mt,
                "rows_per_second": round(len(tr) / max(secs, 1e-9))}
@@ -295,12 +276,90 @@ def train_table(columns, rows=None, target: str | None = None, task: str = "auto
         fitted.append((l, pv, pt, mv))
         emit({"type": "learner_done", **row})
 
+    def fit_here(l, until):
+        t0 = time.perf_counter()
+
+        def report(step, total, val=None, train_loss=None, note=None, _k=l.key, _t0=t0):
+            emit({"type": "progress", "learner": _k, "step": step, "total": total, "val": val, "train_loss": train_loss, "note": note,
+                  "t": round(time.perf_counter() - _t0, 3)})
+        try:
+            l.extra_eval = Xte
+            l.fit(Xtr, ytr, Xva, yva, T, until, report, stop)
+        except Exception as e:  # one learner failing must not lose the others
+            l.extra_eval = None
+            emit({"type": "learner_failed", "learner": l.key, "error": str(e)})
+            return
+        secs = time.perf_counter() - t0
+        finish(l, *finished_predictions(l, Xva, Xte), secs)
+
+    real = [l for l in pool if l.key != "baseline"]
+    if stop is not None and stop.is_set():
+        raise DataError("Training was stopped before any model finished.")
+    for l in pool:
+        if l.key == "baseline":
+            emit({"type": "learner_start", "learner": l.key, "label": l.label, "blurb": l.blurb, "seconds": 0.0})
+            fit_here(l, learn_until)
+    left = learn_until - time.perf_counter()
+    if real and left < 0.05 * total_budget:
+        # reading the data used up (nearly) all the time: rather than end with no model, the one-shot net (no epochs,
+        # it sizes itself to the time) still learns, even if that takes a little longer than allowed
+        keep = next((l for l in real if l.key == "oneshot"), real[0])
+        for l in real:
+            if l is not keep:
+                emit({"type": "learner_skipped", "learner": l.key, "label": l.label, "why": "out of time"})
+        say(f"Reading the data used almost all the time, so only the {keep.label.lower()} learns (it needs no epochs). "
+            "Choose Balanced to give every learner time.")
+        emit({"type": "learner_start", "learner": keep.key, "label": keep.label, "blurb": keep.blurb, "seconds": round(max(left, 0.02), 2)})
+        fit_here(keep, time.perf_counter() + max(left, 0.02))
+    elif parallel and len(real) > 1 and can_fork():
+        # all learners at once, one process each, every one of them with all the time that is left
+        give = max(0.02, learn_until - time.perf_counter())
+        started = time.perf_counter()
+        for l in real:
+            emit({"type": "learner_start", "learner": l.key, "label": l.label, "blurb": l.blurb, "seconds": round(give, 2)})
+
+        def on_progress(l, e):
+            emit({"type": "progress", "learner": l.key, **e})
+
+        def on_done(l, payload):
+            model, pv, pt, secs = payload
+            finish(model, pv, pt, secs)
+
+        def on_failed(l, msg):
+            emit({"type": "learner_failed", "learner": l.key, "error": msg})
+        race(real, (Xtr, ytr, Xva, yva, Xte, T), learn_until, stop, on_progress, on_done, on_failed,
+             hard_deadline=deadline - 0.4 * reserve)           # never past the job's own deadline
+        board.sort(key=lambda r: ORDER.index(r["learner"]) if r["learner"] in ORDER else 99)
+        emit({"type": "stage", "text": f"{len([f for f in fitted if f[0].key != 'baseline'])} learners trained side by side in "
+                                       f"{time.perf_counter() - started:.1f} s.", "t": round(time.perf_counter() - t_start, 3)})
+    else:
+        shares = dict(SHARES, linear=0.5) if Xtr.has_text else SHARES     # only the linear model reads text, so give it time
+        for i, l in enumerate(real):
+            if stop is not None and stop.is_set():
+                break
+            have_model = any(f[0].key != "baseline" for f in fitted)
+            if have_model and time.perf_counter() >= learn_until:
+                emit({"type": "learner_skipped", "learner": l.key, "label": l.label, "why": "out of time"})
+                continue
+            left = max(0.0, learn_until - time.perf_counter())
+            rest = sum(shares.get(q.key, 0) for q in real[i:]) or 1
+            give = max(0.02, left * shares.get(l.key, 0) / rest)
+            emit({"type": "learner_start", "learner": l.key, "label": l.label, "blurb": l.blurb, "seconds": round(give, 2)})
+            fit_here(l, time.perf_counter() + give)
+
     learned = [f for f in fitted if f[0].key != "baseline"] or fitted
     if not learned:
         raise DataError("Training was stopped before any model finished.")
-    # choose on the validation rows: the single model or average of the best few whose predictions fit them best
-    # (log loss for classes, RMSE for numbers: both are steadier than accuracy on small validation sets)
-    fit_loss = (lambda m: m["log_loss"]) if T.kind == "classification" else (lambda m: m["rmse"])
+    # choose on the validation rows: the single model or average of the best few whose predictions fit them best.
+    # Numbers: RMSE. Categories: log loss on small validation sets (steadier than accuracy there); accuracy first
+    # from 1,000 validation rows on, because some learners (word counts) are right more often than their
+    # probabilities suggest.
+    if T.kind != "classification":
+        fit_loss = lambda m: m["rmse"]
+    elif len(yva) >= 1000:
+        fit_loss = lambda m: (-m["accuracy"], m["log_loss"])
+    else:
+        fit_loss = lambda m: m["log_loss"]
     learned.sort(key=lambda f: fit_loss(f[3]))
     options = [[learned[0]]] + [learned[:k] for k in (2, 3, len(learned)) if 2 <= k <= len(learned)]
     scored = []
@@ -317,9 +376,10 @@ def train_table(columns, rows=None, target: str | None = None, task: str = "auto
     name = " + ".join(f[0].label for f in choice)
     say(f"Winner: {name}. Measuring which columns it relies on…")
     groups = None
-    if image:                      # pictures: importance per kind of feature (shape, colours, edges), not per pixel
-        from .images import GROUPS, groups as image_groups
-        groups = image_groups()
+    media = "image" if image is True else (image or None)      # "image", "audio" or "video": files from a zip of folders
+    if media:                      # importance per kind of feature (shape, colours, edges / tone, timbre / motion…)
+        from .media import groups_for
+        groups = groups_for(media)
     importance = permutation_importance(model, Xva, yva, enc, used, until=deadline - 0.02 * total_budget, groups=groups)
     total = time.perf_counter() - t_start
     model.report = {
@@ -330,13 +390,19 @@ def train_table(columns, rows=None, target: str | None = None, task: str = "auto
         "profile": prof, "leaderboard": board, "winner": [f[0].key for f in choice], "winner_label": name,
         "valid": choice_m, "test": test_m, "baseline_test": base["test"] if base else None, "importance": importance,
         "seconds_total": round(total, 3), "seconds_learning": round(time.perf_counter() - t_models, 3), "budget": round(total_budget, 3),
-        "first_model_seconds": next((r["seconds"] for r in board if r["learner"] != "baseline"), None),
+        "first_model_seconds": min((r["seconds"] for r in board if r["learner"] != "baseline"), default=None),
     }
-    if image:
-        model.report["image"] = {"groups": list(GROUPS), "pictures": n}
-        model.report["profile"] = []                     # 936 number columns: not worth keeping
+    if not importance and Xva.n >= 5:
+        model.report["importance_note"] = "no time"        # the time ran out before it could be measured
+    if media:
+        model.report["media"] = media
+        if media == "image":
+            model.report["image"] = {"groups": list(groups), "pictures": n}
+        else:
+            model.report[media] = {"groups": list(groups), "items": n}
+        model.report["profile"] = []                     # hundreds of number columns: not worth keeping
         model.report["ignored"] = []
-        model.report["columns_used"] = list(GROUPS)
+        model.report["columns_used"] = list(groups)
     emit({"type": "done", "report": model.report})
     return model
 

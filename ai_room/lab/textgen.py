@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import time
 from collections import Counter, defaultdict
@@ -26,6 +27,7 @@ CMASK = (1 << CBITS) - 1
 CTX = 36                         # a context is remembered by a 36-bit hash; key = context << 14 | next character
 PRIME = np.uint64(0x9E3779B97F4A7C15)
 MAX_CHARS = int(float(__import__("os").environ.get("AI_ROOM_LAB_TEXT_CHARS", 32_000_000)))   # learned at most; bigger texts are sampled
+PARALLEL_CHARS = 1_000_000       # from this size on, several context lengths are counted at once (threads)
 U = np.uint64
 
 
@@ -114,6 +116,49 @@ def _padded(ids: np.ndarray, pad: int) -> np.ndarray:
     return np.concatenate([np.ones(pad, np.uint64), ids.astype(np.uint64) + U(1)])
 
 
+def _count_one(P1, pad, n, h0, k0, k, order, raw_all):
+    """The counts for context length k, continuing the unmixed running hash h0 of length k0 (< k)."""
+    h = h0.copy()
+    with np.errstate(over="ignore"):
+        for j in range(k0 + 1, k + 1):
+            h *= PRIME
+            h += P1[pad - j: pad - j + n]
+    nxt = P1[pad:] - U(1)
+    key = _mix(h) << U(CBITS)
+    key |= nxt
+    if k < order:
+        triples = key << U(CBITS)
+        triples |= P1[pad - k - 1: pad - k - 1 + n]
+        triples.sort()
+        r = _runs(triples >> U(CBITS)) if raw_all else None
+        return k, r, _runs(_runs(triples)[0] >> U(CBITS))
+    return k, _runs(np.sort(key)), None
+
+
+def _count_iter(P1, pad, n, ks, order, raw_all):
+    """(k, raw (keys, counts) or None, continuation (keys, counts) or None) for each context length k in ks.
+
+    One sort of packed (context, next, previous character) numbers gives the raw counts (keys come out sorted)
+    and the distinct triples, i.e. the continuation counts."""
+    nxt = P1[pad:] - U(1)
+    want = set(ks)
+    for k, h in _hashes(P1, max(ks), pad):
+        if k not in want:
+            continue
+        key = h << U(CBITS)
+        key |= nxt
+        if k < order:
+            triples = key << U(CBITS)
+            triples |= P1[pad - k - 1: pad - k - 1 + n]          # previous character + 1 (padding = 1)
+            triples.sort()
+            r = _runs(triples >> U(CBITS)) if raw_all else None
+            c = _runs(_runs(triples)[0] >> U(CBITS))
+            del triples
+        else:
+            r, c = _runs(np.sort(key)), None
+        yield k, r, c
+
+
 class CharModel:
     """Character model with interpolated modified Kneser–Ney smoothing.
 
@@ -152,34 +197,51 @@ class CharModel:
     def _encode(self, text: str) -> np.ndarray:
         return self._ids(np.frombuffer(text.encode("utf-32-le", "surrogatepass"), dtype=np.uint32))
 
-    def _count(self, ids: np.ndarray, order: int, raw_all: bool = False, stop_at: float | None = None):
-        """Raw counts (all lengths if raw_all, else only the longest) and continuation counts for 1..order."""
+    def _count(self, ids: np.ndarray, order: int, raw_all: bool = False, stop_at: float | None = None, keep_last_raw: bool = False):
+        """Raw counts (all lengths if raw_all, else only the longest) and continuation counts for 1..order.
+
+        Each context length is counted independently, so on big texts several lengths are counted at once in
+        threads. The work is NumPy sorting and array arithmetic, which runs outside Python's global lock, and
+        threads share the arrays instead of copying them between processes."""
+        from concurrent.futures import ThreadPoolExecutor
         pad = order + 1
         P1 = _padded(ids, pad)
         n = len(ids)
-        nxt = P1[pad:] - U(1)
         raw, cont = [None] * order, [None] * order
         got = order
-        for k, h in _hashes(P1, order, pad):
-            key = h << U(CBITS)
-            key |= nxt
-            if k < order:
-                # one sort of (context, next, previous character) gives everything: the keys come out sorted with
-                # their raw counts, and the distinct triples give the continuation counts
-                triples = key << U(CBITS)
-                triples |= P1[pad - k - 1: pad - k - 1 + n]          # previous character + 1 (padding = 1)
-                triples.sort()
-                if raw_all:
-                    raw[k - 1] = Stats(*_runs(triples >> U(CBITS)))
-                cont[k - 1] = Stats(*_runs(_runs(triples)[0] >> U(CBITS)))
-                del triples
-            else:
-                raw[k - 1] = Stats(*_runs(np.sort(key)))
-            if k == 1:
-                first = (raw[0] or cont[0]).keys
-            if stop_at is not None and time.perf_counter() > stop_at and k < order and (raw_all or k == order):
-                got = k
-                break
+        workers = max(1, min(order, os.cpu_count() or 1))
+        if n >= PARALLEL_CHARS and workers > 1:
+            # count `workers` lengths at a time, one thread each, every one continuing from the running hash;
+            # between batches, check that the next batch still fits the time
+            h, hk = np.zeros(n, np.uint64), 0
+            while hk < order:
+                t_batch = time.perf_counter()
+                ks = list(range(hk + 1, min(order, hk + workers) + 1))
+                with ThreadPoolExecutor(len(ks)) as ex:
+                    done = list(ex.map(lambda k, h=h, hk=hk: _count_one(P1, pad, n, h, hk, k, order, raw_all or keep_last_raw), ks))
+                for k, r, c in done:
+                    raw[k - 1] = None if r is None else Stats(*r)
+                    cont[k - 1] = None if c is None else Stats(*c)
+                if keep_last_raw and not raw_all:          # only the longest length so far may become the model's top
+                    for j in range(1, ks[-1]):
+                        raw[j - 1] = None
+                with np.errstate(over="ignore"):
+                    for k in ks:
+                        h = h * PRIME + P1[pad - k: pad - k + n]
+                hk = ks[-1]
+                if stop_at is not None and hk < order and time.perf_counter() + (time.perf_counter() - t_batch) > stop_at:
+                    got = hk
+                    break
+            first = (raw[0] or cont[0]).keys
+        else:
+            for k, r, c in _count_iter(P1, pad, n, list(range(1, order + 1)), order, raw_all):
+                raw[k - 1] = None if r is None else Stats(*r)
+                cont[k - 1] = None if c is None else Stats(*c)
+                if k == 1:
+                    first = (raw[0] or cont[0]).keys
+                if stop_at is not None and time.perf_counter() > stop_at and k < order and (raw_all or k == order):
+                    got = k
+                    break
         raw, cont = raw[:got], cont[:got]
         if got < order:
             cont[-1] = None
@@ -205,6 +267,8 @@ class CharModel:
         # the choice is made on (at most) 2 million characters taken from 20 evenly spaced places, each split 90/10,
         # so both the learned part and the held-back part represent the whole text, not just its beginning
         S = min(len(ids), 2_000_000)
+        if deadline is not None:                   # a short budget gets a smaller sample, so every length can be tried
+            S = min(S, max(100_000, int((deadline - t0) * 400_000)))
         pieces = 20 if len(ids) > 200_000 else 1
         size = S // pieces
         starts = np.linspace(0, len(ids) - size, pieces).astype(np.int64)
@@ -214,7 +278,7 @@ class CharModel:
         say(stage="counting", text=f"Counting contexts of 1–{self.max_order} characters in {len(tr):,} characters…")
         t1 = time.perf_counter()
         raw, cont, got = self._count(tr, self.max_order, raw_all=True, stop_at=None if budget is None else t0 + 0.45 * budget)
-        rate = len(tr) * got / max(time.perf_counter() - t1, 1e-6) * 1.4      # characters × lengths per second (the final pass does less work)
+        rate = len(tr) * got / max(time.perf_counter() - t1, 1e-6)      # characters × lengths per second (on the cautious side)
         if got < self.max_order:
             say(stage="counting", text=f"Out of time after contexts of {got} characters; choosing among those.")
         curve = self._curve(tr, va, raw, cont)
@@ -225,21 +289,23 @@ class CharModel:
         self.order = best
         self.levels = cont[: best - 1] + [raw[best - 1]]
         learned = len(tr)
+        # then learn as much of the text as the measured speed says fits, at the chosen length
         left = None if deadline is None else deadline - time.perf_counter() - 0.03 * budget
         can = len(ids) if left is None else int(rate * max(left, 0) / best)
         if can >= min(len(ids), max(len(tr) * 1.05, 50_000)) or (pieces > 1 and can >= len(tr)):
             take = min(len(ids), can)
             say(stage="final", text=f"Best context: {best} characters. Learning {'all of the text' if take == len(ids) else f'the first {take:,} characters'} with it…")
             del raw, cont
-            raw2, cont2, _ = self._count(ids[:take], best)
-            self.levels = cont2[:-1] + [raw2[-1]]
+            raw2, cont2, got2 = self._count(ids[:take], best, stop_at=None if deadline is None else deadline - 0.05 * budget, keep_last_raw=True)
+            self.order = got2                       # lower than `best` only if a batch of lengths would not have fitted
+            self.levels = cont2[: got2 - 1] + [raw2[got2 - 1]]
             learned = take
         else:
             say(stage="final", text=f"Best context: {best} characters. Keeping the model learned from the first {learned:,} characters (no time for more).")
         secs = time.perf_counter() - t0
         V = len(self.chars)
-        self.report = {"chars": len(text), "learned_chars": learned, "vocab": V, "order": best, "seconds": round(secs, 3),
-                       "chars_per_second": round(learned / max(secs, 1e-9)), "valid_bits_per_char": round(float(curve[best - 1]), 4),
+        self.report = {"chars": len(text), "learned_chars": learned, "vocab": V, "order": self.order, "seconds": round(secs, 3),
+                       "chars_per_second": round(learned / max(secs, 1e-9)), "valid_bits_per_char": round(float(curve[self.order - 1]), 4),
                        "valid_chars": int(len(va)), "bits_by_order": [round(float(b), 4) for b in curve], "random_bits_per_char": round(math.log2(max(V, 2)), 4),
                        "letter_frequency_bits_per_char": round(uni_bits, 4), "contexts": int(sum(len(l.keys) for l in self.levels))}
         return self

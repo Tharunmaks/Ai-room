@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-room"
-version = "0.5.0"
-description = "Train untrained models on your own tables, texts and pictures in seconds on a CPU (the Lab), a classroom where a ≤27B model learns without training, and a Workshop of 1,200+ tools"
+version = "0.6.0"
+description = "Train untrained models on your own tables, texts, pictures, sounds and videos in seconds on a CPU (the Lab), a classroom where a ≤27B model learns without training, and a Workshop of 1,200+ tools"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.27", "numpy>=1.24", "pillow>=9"]
+dependencies = ["fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.27", "numpy>=1.24", "pillow>=9", "threadpoolctl>=3"]
 
 [project.optional-dependencies]
 pdf = ["pypdf"]

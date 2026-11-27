@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 from .api import write_card
-from .automl import RATE_LABEL, SPEEDS, Trained, budget_for, new_id, train_table
+from .automl import MIN_SECONDS, RATE_LABEL, SPEEDS, Trained, budget_for, new_id, train_table
 from .data import DataError
 from .ingest import human, load_table, load_text, sniff_path
 from .textgen import MAX_CHARS, TextModel, train_text
@@ -65,8 +65,8 @@ def cmd_train(a) -> None:
     say = lambda text: show({"type": "stage", "text": text})
     try:
         kind = sniff_path(path, path.name)
-        print(f"Learning {path.name} ({human(size)}) from scratch as {dict(text='text', images='pictures').get(kind, 'a table')}; "
-              f"time allowed: {budget:.1f} s ({RATE_LABEL}{', at least 1 s' if budget <= 1 else ''}) …", flush=True)
+        print(f"Learning {path.name} ({human(size)}) from scratch as {dict(text='text', images='pictures', sounds='sounds', videos='videos').get(kind, 'a table')}; "
+              f"time allowed: {budget:.1f} s ({RATE_LABEL}{f', at least {MIN_SECONDS:g} s' if budget <= MIN_SECONDS else ''}) …", flush=True)
         if kind == "text":
             docs, _ = load_text(path, path.name, MAX_CHARS, say=say)
             model = train_text(docs, progress=show, deadline=deadline - 0.12 * budget)
@@ -74,12 +74,19 @@ def cmd_train(a) -> None:
             from .images import load_image_zip
             table = load_image_zip(path, deadline=t0 + 0.45 * budget, say=say)
             model = train_table(table, None, "category", task="classification", progress=show, deadline=deadline - 0.03 * budget, image=True)
+        elif kind in ("sounds", "videos"):
+            from .media import MEDIA_OF, describe, load_zip
+            describe(path, MEDIA_OF[kind])                      # checks the folders (and ffmpeg) before spending time
+            table = load_zip(path, MEDIA_OF[kind], deadline=t0 + 0.55 * budget, say=say)
+            model = train_table(table, None, "category", task="classification", progress=show, deadline=deadline - 0.03 * budget,
+                                image=MEDIA_OF[kind])
         elif kind == "table":
             table = load_table(path, path.name, say=say)
             model = train_table(table, None, a.target, task=a.task, ignore=[c.strip() for c in (a.ignore or "").split(",") if c.strip()],
                                 progress=show, deadline=deadline - 0.03 * budget)
         else:
-            raise SystemExit("That kind of file cannot be learned yet: use a table, a text, or a .zip of pictures in one folder per category.")
+            raise SystemExit("That kind of file cannot be learned yet: use a table, a text, or a .zip of pictures, sounds or videos "
+                             "in one folder per category.")
     except (DataError, ValueError) as e:
         raise SystemExit(str(e))
     folder = Path(a.out) if a.out else lab_dir(a.data) / "models" / new_id()
@@ -95,7 +102,7 @@ def cmd_train(a) -> None:
     else:
         key, fmt = ("accuracy", "{:.1%}") if r["task"] == "classification" else ("r2", "{:.3f}")
         base = fmt.format(r["baseline_test"][key]) if r["baseline_test"] else "—"
-        print(f"Winner: {r['winner_label']}. On {r['split']['test']:,} rows it never saw: {key} {fmt.format(r['test'][key])} (no learning: {base}).")
+        print(f"Winner: {r['winner_label']}. On {r['split']['test']:,} {'files' if r.get('media') else 'rows'} it never saw: {key} {fmt.format(r['test'][key])} (no learning: {base}).")
         print(f"Done in {secs:.2f} s of the {budget:.1f} s allowed; the first model was ready after {r['first_model_seconds']:.2f} s.")
         if r.get("sampled"):
             print(f"The file has about {r['file_rows']:,} rows; it learned from a random sample of {r['rows']:,}.")
@@ -111,10 +118,15 @@ def cmd_predict(a) -> None:
     if isinstance(m, TextModel):
         raise SystemExit("That is a text model: use `ai-room lab write` or `ai-room lab ask`.")
     path = Path(a.file)
-    from .data import IMAGE_EXT, ext_of
-    if m.report.get("image") and ext_of(path.name) in IMAGE_EXT:          # one picture: print the answer
-        from .images import image_table
-        p = m.predict(image_table([path.read_bytes()]))[0]
+    from .api import media_of
+    from .data import ext_of
+    kind = media_of(m)
+    if kind and ext_of(path.name) != ".zip":               # one picture, sound or video: print the answer
+        from .media import media_table
+        try:
+            p = m.predict(media_table(kind, [(path.name, path.read_bytes())]))[0]
+        except DataError as e:
+            raise SystemExit(str(e))
         print(f"{path.name}: {p['prediction']} ({p['confidence']:.0%} sure) — " + ", ".join(f"{t['label']} {t['p']:.0%}" for t in p["top"]))
         return
     out = Path(a.out) if a.out else None
@@ -170,16 +182,16 @@ def cmd_models(a) -> None:
 def add_parser(sub) -> None:
     lab = sub.add_parser("lab", help="train untrained models on your own data, fast, on the CPU")
     ls = lab.add_subparsers(dest="lab_cmd", required=True)
-    t = ls.add_parser("train", help="learn a table (CSV/TSV/JSON) or a text (txt/md/pdf/docx/epub/zip)")
+    t = ls.add_parser("train", help="learn a table (CSV/TSV/JSON/Excel), a text (txt/md/pdf/docx/epub), or a .zip of pictures, sounds or videos in one folder per category")
     t.add_argument("file")
     t.add_argument("--target", help="column to predict (default: guessed, usually the last)")
     t.add_argument("--task", choices=["auto", "classification", "regression"], default="auto")
     t.add_argument("--ignore", help="comma-separated columns to leave out")
     t.add_argument("--speed", choices=list(SPEEDS) + ["quick"], default="fast",
-                   help="time allowed: fast = 10 min per GB of data (0.6 s per MB, at least 1 s); balanced ≥ 30 s; thorough ≥ 2 min")
+                   help="time allowed: fast = 5 min per GB of data (0.3 s per MB, at least 0.5 s); balanced ≥ 30 s; thorough ≥ 2 min")
     t.add_argument("--name")
     t.add_argument("--out", help="folder to save the model in (default: data/lab/models/<id>)")
-    p = ls.add_parser("predict", help="add predictions to every row of a table")
+    p = ls.add_parser("predict", help="add predictions to every row of a table (or name one picture, sound or video)")
     p.add_argument("model", help="model id (see `ai-room lab models`) or folder")
     p.add_argument("file")
     p.add_argument("--out", help="CSV to write (default: print)")

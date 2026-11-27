@@ -8,6 +8,28 @@ Object.assign(ICONS, {
   pencil: '<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="m13 7 4 4"/>', redo: '<path d="M20 12a8 8 0 1 1-2.3-5.6"/><path d="M20 4v5h-5"/>',
   clip: '<rect x="6" y="4" width="12" height="17" rx="2"/><path d="M9 4h6v3H9z"/>', photo: '<rect x="3" y="5" width="18" height="14" rx="2.5"/><circle cx="9" cy="10" r="1.8"/><path d="m21 16-5-5-8 8"/>',
 });
+Object.assign(ICONS, {
+  mic: '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/>',
+  wave: '<path d="M3 12h2M7 8v8M11 5v14M15 9v6M19 7v10M21 12h0"/>',
+  film: '<rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 4v16M17 4v16M3 9h4M3 15h4M17 9h4M17 15h4"/>',
+});
+/* pictures, sounds and videos: a zip with one folder per category; the same learners learn the numbers made from each file */
+const MEDIA = {
+  images: { type: "image", ic: "🖼️", icon: "photo", one: "picture", many: "pictures", eg: "cats/ and dogs/", accept: "image/*",
+    how: "Every picture becomes 936 numbers — its shape (a small grey thumbnail), colour layout, edges and colour mix —",
+    sheet: "A few example pictures from each category", feat: "shape, colours, edges", looks: "This looks like",
+    note: "Works best when shape and colour tell the categories apart (products, plants, symbols, scans); it is not a deep network." },
+  sounds: { type: "audio", ic: "🔊", icon: "wave", one: "sound", many: "sounds", eg: "barks/ and meows/", accept: "audio/*,.wav,.mp3,.ogg,.oga,.flac,.m4a,.aac,.opus,.weba,.aif,.aiff",
+    how: "Every sound becomes 212 numbers — how loud it is in 40 pitch bands, its timbre, how bright and noisy it is, and how its loudness rises and falls —",
+    sheet: "Spectrograms (pitch from low to high, time from left to right) of a few sounds from each category", feat: "tone, timbre, loudness, changes over time", looks: "This sounds like",
+    note: "Works best when the sound itself tells the categories apart (instruments, machines, alarms, animal calls, single spoken words); it is not speech recognition." },
+  videos: { type: "video", ic: "🎬", icon: "film", one: "video", many: "videos", eg: "waving/ and clapping/", accept: "video/*,.gif,.mp4,.mov,.webm,.mkv,.avi,.m4v,.mpg,.mpeg,.wmv,.3gp",
+    how: "Every video becomes 1,172 numbers — what 8 evenly spaced frames look like, how and where things move, and its sound —",
+    sheet: "The first frame of a few videos from each category", feat: "look, motion, sound", looks: "This looks like",
+    note: "Works best for short clips where the look, the movement or the sound tells the categories apart (gestures, exercises, machines, scenes); it is not a deep network." },
+};
+const MEDIA_OF_TYPE = { image: MEDIA.images, audio: MEDIA.sounds, video: MEDIA.videos };
+const KIND_IC = { text: "📄", images: "🖼️", sounds: "🔊", videos: "🎬" };
 const LAB = {
   info: null, datasets: [], models: [], jobs: [], sel: null, ds: null, model: null, job: null, timer: null,
   speed: store.get("lab.speed", "fast"), ignore: new Set(), target: null, task: "auto", out: null,
@@ -15,12 +37,12 @@ const LAB = {
 try { LAB.sel = JSON.parse(store.get("lab.sel", "null")); } catch (e) { LAB.sel = null; }
 const LEARNERS = {
   baseline: { label: "Baseline (no learning)", s: 0 }, oneshot: { label: "One-shot net", s: 1 }, linear: { label: "Linear model", s: 2 },
-  boost: { label: "Boosted trees", s: 3 }, mlp: { label: "Neural network", s: 4 },
+  boost: { label: "Boosted trees", s: 3 }, mlp: { label: "Neural network", s: 4 }, words: { label: "Word counts", s: 5 },
 };
 const KIND_LABEL = { number: "number", category: "category", text: "text", date: "date", id: "ignored · ID", constant: "ignored · constant", empty: "ignored · empty" };
 const fmtBytes = (b) => (b >= 1e12 ? `${(b / 1e12).toFixed(2)} TB` : b >= 1e9 ? `${(b / 1e9).toFixed(2)} GB` : b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : b >= 1e3 ? `${Math.round(b / 1e3)} KB` : `${b} B`);
 const approx = (n, exact) => `${exact === false ? "≈ " : ""}${(n || 0).toLocaleString()}`;
-const budgetOf = (bytes, speed) => { const sp = LAB.info.speeds.find((x) => x.key === speed) || LAB.info.speeds[0]; const perMb = Math.max(1, (bytes / 1e6) * LAB.info.seconds_per_mb); return sp.key === "fast" ? perMb : Math.max(sp.seconds, perMb); };
+const budgetOf = (bytes, speed) => { const sp = LAB.info.speeds.find((x) => x.key === speed) || LAB.info.speeds[0]; const perMb = Math.max(LAB.info.min_seconds ?? 1, (bytes / 1e6) * LAB.info.seconds_per_mb); return sp.key === "fast" ? perMb : Math.max(sp.seconds, perMb); };
 const fmtSec = (s) => (s == null ? "—" : s < 0.01 ? "<0.01 s" : s < 10 ? `${s.toFixed(2)} s` : s < 120 ? `${s.toFixed(1)} s` : `${Math.round(s / 60)} min`);
 const fmtNum = (x) => (x == null || !isFinite(x) ? "—" : Math.abs(x) >= 1000 ? Math.round(x).toLocaleString() : Math.abs(x) >= 10 ? x.toFixed(1) : x.toPrecision(3));
 const scoreOf = (task, m) => (!m ? null : task === "classification" ? m.accuracy : m.r2);
@@ -37,14 +59,14 @@ async function renderLab() {
     [LAB.info, LAB.datasets, LAB.models, LAB.jobs] = await Promise.all([api("/api/lab/info"), api("/api/lab/datasets"), api("/api/lab/models"), api("/api/lab/jobs")]);
   } catch (e) { el.innerHTML = `<div class="empty"><div class="big">⚠️</div>${esc(e.message)}</div>`; return; }
   el.innerHTML = `
-    <div class="page-head"><div><h2>Lab</h2><p>Give it a table, some text or folders of pictures. Brand-new, untrained models learn it from scratch on this computer — usually in seconds — and your data never leaves the machine.</p></div>
+    <div class="page-head"><div><h2>Lab</h2><p>Give it a table, some text, or folders of pictures, sounds or videos. Brand-new, untrained models learn it from scratch on this computer — usually in seconds — and your data never leaves the machine.</p></div>
       <div class="grow"></div><div class="row wrap gap-s" id="labStats"></div></div>
     <div class="lab">
       <aside class="lab-side">
         <label class="lab-drop" id="labDrop" tabindex="0">
           <input type="file" id="labFile" hidden accept=".csv,.tsv,.tab,.json,.jsonl,.ndjson,.xlsx,.xlsm,.txt,.md,.markdown,.rst,.html,.htm,.pdf,.docx,.epub,.zip,.py,.js,.log">
           <span class="lab-drop-ic">${icon("upload")}</span><b>Drop a file here or click to upload</b>
-          <span class="small muted"><b>Tables</b>: Excel, CSV, TSV, JSON · <b>Text</b>: TXT, MD, HTML, PDF, DOCX, EPUB · <b>Pictures</b>: a ZIP with one folder per category — up to ${esc(LAB.info.max_label)} per file (${esc(LAB.info.disk_free_label)} free)</span>
+          <span class="small muted"><b>Tables</b>: Excel, CSV, TSV, JSON · <b>Text</b>: TXT, MD, HTML, PDF, DOCX, EPUB · <b>Pictures, sounds, videos</b>: a ZIP with one folder per category — up to ${esc(LAB.info.max_label)} per file (${esc(LAB.info.disk_free_label)} free)</span>
           <span class="lab-up" id="labUp" hidden><span class="bar"><span id="labUpBar" style="width:0%"></span></span><small id="labUpTxt"></small></span>
         </label>
         <div class="row wrap gap-s"><button class="btn sm" data-act="lab-paste">${icon("clip")} Paste a table or text</button>
@@ -66,7 +88,7 @@ async function renderLab() {
 }
 function paintStats() {
   const el = $("#labStats"); if (!el) return;
-  el.innerHTML = `<span class="chip">${icon("brain")} ${plural(LAB.models.length, "model")}</span><span class="chip">${icon("table")} ${plural(LAB.datasets.length, "dataset")}</span><span class="chip" title="Training uses all CPU cores, no GPU needed">⚙️ ${LAB.info.cpus} CPU cores</span><span class="chip on" title="The fast setting gives the whole job ${esc(LAB.info.rate_label)} of data (at least 1 second)">⚡ ${esc(LAB.info.rate_label)}</span>`;
+  el.innerHTML = `<span class="chip">${icon("brain")} ${plural(LAB.models.length, "model")}</span><span class="chip">${icon("table")} ${plural(LAB.datasets.length, "dataset")}</span><span class="chip" title="Training uses all CPU cores, no GPU needed">⚙️ ${LAB.info.cpus} CPU cores</span><span class="chip on" title="The fast setting gives the whole job ${esc(LAB.info.rate_label)} of data (at least ${LAB.info.min_seconds} s); the learners run side by side, one per core">⚡ ${esc(LAB.info.rate_label)}</span>`;
 }
 function valid(sel) {
   if (sel.kind === "model") return LAB.models.some((m) => m.id === sel.id);
@@ -112,7 +134,7 @@ async function uploadData(f) {
   }
 }
 
-const dsSummary = (d) => (d.kind === "text" ? `${approx(d.chars, d.chars_exact)} characters` : d.kind === "images" ? `${(d.images || 0).toLocaleString()} pictures · ${Object.keys(d.classes || {}).length} categories`
+const dsSummary = (d) => (d.kind === "text" ? `${approx(d.chars, d.chars_exact)} characters` : MEDIA[d.kind] ? `${(d.images ?? d.items ?? 0).toLocaleString()} ${MEDIA[d.kind].many} · ${Object.keys(d.classes || {}).length} categories`
   : `${approx(d.rows, d.rows_exact)} rows · ${(d.columns || []).length} columns`);
 function paintLists() {
   paintStats();
@@ -123,11 +145,11 @@ function paintLists() {
     ${live.length ? `<h4 class="lab-h">Learning now</h4>${live.map((j) => `<button class="lab-item${on("job", j.id)}" data-act="lab-open" data-arg="job:${j.id}"><span class="pulse"></span><span class="grow"><b>${esc(j.dataset_name)}</b><small>${j.status === "queued" ? "waiting for the trainer" : "training…"}</small></span></button>`).join("")}` : ""}
     <h4 class="lab-h">Trained models</h4>
     ${LAB.models.map((m) => `<button class="lab-item${on("model", m.id)}" data-act="lab-open" data-arg="model:${m.id}">
-        <span class="lab-ic">${m.type === "text" ? "✍️" : m.type === "image" ? "🖼️" : m.task === "classification" ? "🏷️" : "📈"}</span>
+        <span class="lab-ic">${m.type === "text" ? "✍️" : MEDIA_OF_TYPE[m.type] ? MEDIA_OF_TYPE[m.type].ic : m.task === "classification" ? "🏷️" : "📈"}</span>
         <span class="grow"><b>${esc(m.name)}</b><small>${m.type === "text" ? `${m.score.bits_per_char.toFixed(2)} bits/char` : `${scoreName(m.task)} ${fmtScore(m.task, scoreOf(m.task, m.score))}`} · ${fmtSec(m.seconds)}</small></span></button>`).join("") || `<p class="small muted">None yet. Pick a dataset and press <b>Train</b>.</p>`}
     <h4 class="lab-h">Datasets</h4>
     ${LAB.datasets.map((d) => `<button class="lab-item${on("dataset", d.id)}" data-act="lab-open" data-arg="dataset:${d.id}">
-        <span class="lab-ic">${{ text: "📄", images: "🖼️" }[d.kind] || "📊"}</span>
+        <span class="lab-ic">${KIND_IC[d.kind] || "📊"}</span>
         <span class="grow"><b>${esc(d.name)}</b><small>${dsSummary(d)} · ${fmtBytes(d.bytes || 0)}</small></span></button>`).join("") || `<p class="small muted">Upload a file, paste one, or try a sample.</p>`}`;
 }
 
@@ -154,7 +176,7 @@ function labWelcome() {
   return `<div class="card lab-welcome">
     <div class="lab-hero-ic">🧪</div>
     <h2>Teach a brand-new AI with your own data</h2>
-    <p class="muted">Give it a <b>table</b> (Excel or CSV) and it learns to predict any column from the others. Give it <b>text</b> and it learns to write like it — and finds the right passage when you ask a question. Give it <b>pictures</b> in one folder per category and it learns to tell them apart.</p>
+    <p class="muted">Give it a <b>table</b> (Excel or CSV) and it learns to predict any column from the others. Give it <b>text</b> and it learns to write like it — and finds the right passage when you ask a question. Give it <b>pictures, sounds or videos</b> in one folder per category and it learns to tell them apart.</p>
     <div class="row wrap gap-s" style="justify-content:center;margin-top:14px"><button class="btn primary" data-act="lab-pick">${icon("upload")} Choose a file</button><button class="btn" data-act="lab-paste">${icon("clip")} Paste data</button><button class="btn" data-act="lab-sample" data-arg="houses">🏠 Try the house-prices sample</button></div>
     <div class="grid g-3" style="margin-top:18px;text-align:left">
       <div class="card flat"><h3>⚡ Starts from zero</h3><p class="small muted">Every model starts with random weights. Nothing is pre-trained; it learns only from what you upload.</p></div>
@@ -169,18 +191,19 @@ function trainButton(label, bytes) {
 }
 function paintDataset() {
   const d = LAB.ds, main = $("#labMain");
-  if (d.kind === "images") {
-    const classes = Object.entries(d.classes || {});
+  const md = MEDIA[d.kind];
+  if (md) {
+    const classes = Object.entries(d.classes || {}), count = d.images ?? d.items ?? 0;
     const most = Math.max(...classes.map(([, n]) => n)), least = Math.min(...classes.map(([, n]) => n));
     main.innerHTML = `<div class="card lab-panel">
-      ${panelHead("🖼️", d.name, `${d.images.toLocaleString()} pictures in ${classes.length} categories · ${fmtBytes(d.bytes)}`, `dataset:${d.id}`)}
-      <p class="muted small">Each folder is a category. Every picture becomes 936 numbers — its shape (a small grey thumbnail), colour layout, edges and colour mix — and the same untrained learners as for tables learn to tell the categories apart.</p>
+      ${panelHead(md.ic, d.name, `${count.toLocaleString()} ${md.many} in ${classes.length} categories · ${fmtBytes(d.bytes)}`, `dataset:${d.id}`)}
+      <p class="muted small">Each folder is a category. ${md.how} and the same untrained learners as for tables learn to tell the categories apart.</p>
       <div class="row wrap gap-s" style="margin:6px 0 12px">${classes.map(([c, n]) => `<span class="chip">${esc(c)} <small>${n.toLocaleString()}</small></span>`).join("")}</div>
-      ${least < 20 ? `<p class="small lab-warn">⚠️ Some categories have very few pictures (${least}). Twenty or more per category gives much better results.</p>` : ""}
-      ${most > least * 5 ? `<p class="small lab-warn">⚠️ The categories are very unequal (${least} to ${most} pictures); the model will lean towards the big ones.</p>` : ""}
-      <img class="lab-sheet" src="/api/lab/datasets/${d.id}/preview.png" alt="A few example pictures from each category" loading="lazy">
-      <div class="lab-go">${speedPicker(d)}${trainButton("Learn these pictures", d.bytes)}</div>
-      <p class="small muted" style="margin:12px 0 0">70% of the pictures to learn from, 15% to check progress, 15% kept back for the final test. Works best when shape and colour tell the categories apart (products, plants, symbols, scans); it is not a deep network.</p>
+      ${least < 20 ? `<p class="small lab-warn">⚠️ Some categories have very few ${md.many} (${least}). Twenty or more per category gives much better results.</p>` : ""}
+      ${most > least * 5 ? `<p class="small lab-warn">⚠️ The categories are very unequal (${least} to ${most} ${md.many}); the model will lean towards the big ones.</p>` : ""}
+      <img class="lab-sheet" src="/api/lab/datasets/${d.id}/preview.png" alt="${esc(md.sheet)}" title="${esc(md.sheet)}" loading="lazy">
+      <div class="lab-go">${speedPicker(d)}${trainButton(`Learn these ${md.many}`, d.bytes)}</div>
+      <p class="small muted" style="margin:12px 0 0">70% of the ${md.many} to learn from, 15% to check progress, 15% kept back for the final test. ${md.note}${md.type !== "image" && !LAB.info.ffmpeg ? ` Without ffmpeg installed, only ${md.type === "audio" ? "WAV" : "animated GIF"} files can be read.` : ""}${md.type !== "image" ? ` With the fastest setting, if time runs out while it is still reading, it learns from the ${md.many} read so far — choose <b>Balanced</b> to read more.` : ""}</p>
     </div>`;
     return;
   }
@@ -189,7 +212,7 @@ function paintDataset() {
       ${panelHead("📄", d.name, `${approx(d.chars, d.chars_exact)} ${d.chars_exact === false ? "bytes of" : "characters ·"} ${d.chars_exact === false ? "text" : plural(d.documents, "document")} · ${fmtBytes(d.bytes)}`, `dataset:${d.id}`)}
       <p class="muted small">A text model counts which character follows every short stretch of text (1 to 10 characters), in one pass. It then writes in the style of your text, and you can search it by asking questions.</p>
       <pre class="lab-pre">${esc(d.preview_text)}${d.chars > 1500 ? "\n…" : ""}</pre>
-      <div class="row wrap" style="margin-top:16px">${trainButton("Learn this text", d.bytes)}<span class="small muted">${esc(LAB.info.rate_label)}, at least 1 s. Texts bigger than 32 million characters are learned from evenly spaced samples.</span></div>
+      <div class="row wrap" style="margin-top:16px">${trainButton("Learn this text", d.bytes)}<span class="small muted">${esc(LAB.info.rate_label)}, at least ${LAB.info.min_seconds} s. Texts bigger than 32 million characters are learned from evenly spaced samples.</span></div>
     </div>`;
     return;
   }
@@ -211,7 +234,7 @@ function paintDataset() {
       ${speedPicker(d)}
       ${trainButton("Train from scratch", d.bytes)}
     </div>
-    <p class="small muted" style="margin:12px 0 0">It splits the rows first: 70% to learn from, 15% to check progress, and 15% locked away for the final, honest test. Fast gives the whole job — reading, learning, testing, saving — ${esc(LAB.info.rate_label)} of data (at least 1 s).${d.rows < 200 ? " With so few rows, scores will jump around — more data helps more than anything." : ""}${d.rows_exact === false ? " If the rows do not fit in memory, it learns from a random sample of them." : ""}</p>
+    <p class="small muted" style="margin:12px 0 0">It splits the rows first: 70% to learn from, 15% to check progress, and 15% locked away for the final, honest test. Fast gives the whole job — reading, learning, testing, saving — ${esc(LAB.info.rate_label)} of data (at least ${LAB.info.min_seconds} s); the four learners run side by side.${d.rows < 200 ? " With so few rows, scores will jump around — more data helps more than anything." : ""}${d.rows_exact === false ? " If the rows do not fit in memory, it learns from a random sample of them." : ""}</p>
   </div>`;
   $("#labTarget").onchange = (e) => { LAB.target = e.target.value; LAB.ignore.delete(LAB.target); paintDataset(); };
 }
@@ -258,11 +281,11 @@ function summaryHTML(kind, m) {
   let text;
   if (kind === "text") text = `It learned ${(r.learned_chars || r.chars).toLocaleString()} characters and predicts the next one using <b>${r.valid_bits_per_char.toFixed(2)} bits</b> — random guessing would need ${r.random_bits_per_char.toFixed(2)}. Use it to write in the style of your text, or to find passages.`;
   else if (r.task === "classification") {
-    const a = r.test.accuracy, b = r.baseline_test?.accuracy ?? 0, what = kind === "image" ? "pictures" : "rows";
-    text = `It gets <b>${(a * 100).toFixed(1)}%</b> of new ${what} right — ${Math.round(a * r.split.test)} of ${r.split.test.toLocaleString()} it had never seen. Always guessing the most common ${kind === "image" ? "category" : "answer"} would get ${(b * 100).toFixed(1)}%.`;
+    const a = r.test.accuracy, b = r.baseline_test?.accuracy ?? 0, md = MEDIA_OF_TYPE[kind], what = md ? md.many : "rows";
+    text = `It gets <b>${(a * 100).toFixed(1)}%</b> of new ${what} right — ${Math.round(a * r.split.test)} of ${r.split.test.toLocaleString()} it had never seen. Always guessing the most common ${md ? "category" : "answer"} would get ${(b * 100).toFixed(1)}%.`;
   } else text = `Its <b>${esc(r.target)}</b> predictions are usually within <b>±${fmtNum(r.test.mae)}</b> of the real value on rows it had never seen, and it explains <b>${Math.max(0, r.test.r2 * 100).toFixed(0)}%</b> of the differences between rows.`;
   const tips = v.label === "Weak" || v.label === "Fair"
-    ? `<ul class="lab-tips"><li>More ${kind === "image" ? "pictures per category" : kind === "text" ? "text" : "rows"} usually helps most.</li>${kind === "text" ? "" : `<li>Try <b>Thorough</b> (Train again) to give the learners more time.</li>`}${kind === "table" ? `<li>Check that the other columns can really predict “${esc(r.target)}”, and leave out any that cannot.</li>` : ""}</ul>` : "";
+    ? `<ul class="lab-tips"><li>More ${MEDIA_OF_TYPE[kind] ? `${MEDIA_OF_TYPE[kind].many} per category` : kind === "text" ? "text" : "rows"} usually helps most.</li>${kind === "text" ? "" : `<li>Try <b>Thorough</b> (Train again) to give the learners more time.</li>`}${kind === "table" ? `<li>Check that the other columns can really predict “${esc(r.target)}”, and leave out any that cannot.</li>` : ""}</ul>` : "";
   return `<div class="lab-summary"><span class="lab-badge ${v.cls}" title="Compared with guessing">${v.ic} ${v.label}</span><p>${text}</p>${tips}</div>`;
 }
 
@@ -309,7 +332,7 @@ function paintJob(full) {
   const task = j.all.find((e) => e.task)?.task || "classification";
   if (full || !$("#labJob")) {
     main.innerHTML = `<div class="card lab-panel" id="labJob">
-      <div class="lab-head"><span class="lab-big-ic">${{ text: "✍️", images: "🖼️" }[j.kind] || "🏁"}</span><div class="grow"><h3 id="labJobTitle"></h3><div class="small muted" id="labJobSub"></div></div>
+      <div class="lab-head"><span class="lab-big-ic">${{ ...KIND_IC, text: "✍️" }[j.kind] || "🏁"}</span><div class="grow"><h3 id="labJobTitle"></h3><div class="small muted" id="labJobSub"></div></div>
         <button class="btn sm" data-act="lab-stop" id="labStop">${icon("stop")} Stop</button></div>
       <div class="lab-time" id="labTime" hidden><span class="bar"><span id="labTimeBar"></span></span></div>
       <ol class="lab-stages" id="labStages"></ol>
@@ -338,18 +361,18 @@ function paintJob(full) {
 function paintModel() {
   const m = LAB.model;
   if (m.type === "text") return paintTextModel();
-  const r = m.report, main = $("#labMain"), task = r.task, img = m.type === "image";
+  const r = m.report, main = $("#labMain"), task = r.task, md = MEDIA_OF_TYPE[m.type], img = !!md, items = md ? md.many : "rows";
   const test = scoreOf(task, r.test), base = scoreOf(task, r.baseline_test);
   const classes = r.classes || [];
   main.innerHTML = `<div class="stack" style="gap:16px">
     <div class="card lab-panel">
-      ${panelHead(img ? "🖼️" : task === "classification" ? "🏷️" : "📈", m.name, img ? `Tells apart ${classes.length} kinds of picture: ${classes.slice(0, 6).map(esc).join(", ")}${classes.length > 6 ? "…" : ""} · winner: ${esc(r.winner_label)}`
+      ${panelHead(img ? md.ic : task === "classification" ? "🏷️" : "📈", m.name, img ? `Tells apart ${classes.length} kinds of ${md.one}: ${classes.slice(0, 6).map(esc).join(", ")}${classes.length > 6 ? "…" : ""} · winner: ${esc(r.winner_label)}`
         : `Predicts <b>${esc(r.target)}</b> (${task === "classification" ? `one of ${classes.length} categories` : "a number"}) · winner: ${esc(r.winner_label)}`, `model:${m.id}`, modelActions(m))}
-      ${summaryHTML(img ? "image" : "table", m)}
+      ${summaryHTML(img ? m.type : "table", m)}
       <div class="lab-tiles">
-        ${tile(task === "classification" ? `Accuracy on unseen ${img ? "pictures" : "rows"}` : "R² on unseen rows", fmtScore(task, test), task === "classification" ? `${Math.round(test * r.split.test)} of ${r.split.test} right` : `typical error ±${fmtNum(r.test.mae)}`, true)}
+        ${tile(task === "classification" ? `Accuracy on unseen ${items}` : "R² on unseen rows", fmtScore(task, test), task === "classification" ? `${Math.round(test * r.split.test)} of ${r.split.test} right` : `typical error ±${fmtNum(r.test.mae)}`, true)}
         ${tile("Without learning", fmtScore(task, base), task === "classification" ? "always the most common answer" : "always the average")}
-        ${tile("Learned in", fmtSec(m.seconds), m.budget ? `of ${fmtSec(m.budget)} allowed · ${r.split.train.toLocaleString()} ${img ? "pictures" : "rows"}` : `from ${r.split.train.toLocaleString()} ${img ? "pictures" : "rows"}`)}
+        ${tile("Learned in", fmtSec(m.seconds), m.budget ? `of ${fmtSec(m.budget)} allowed · ${r.split.train.toLocaleString()} ${items}` : `from ${r.split.train.toLocaleString()} ${items}`)}
         ${tile("First model ready", fmtSec(r.first_model_seconds), "the one-shot net needs no epochs")}
       </div>
       ${r.sampled ? `<p class="small muted" style="margin:10px 0 0">The file has ${approx(r.file_rows, r.rows_exact)} rows — more than fit in memory — so it learned from a random sample of ${r.rows.toLocaleString()}.</p>` : ""}
@@ -357,7 +380,8 @@ function paintModel() {
     </div>
     <div class="grid g-2 lab-grid">
       <div class="card"><h3>${icon("sparkles")} Try it</h3>${img
-        ? `<label class="lab-drop lab-pic-drop" id="labPicDrop" tabindex="0"><input type="file" id="labPic" hidden accept="image/*"><span class="lab-drop-ic">${icon("photo")}</span><b>Drop a picture here or click to choose one</b><span class="small muted">It answers which category it belongs to, and how sure it is.</span></label><div id="labForm"></div>`
+        ? `<label class="lab-drop lab-pic-drop" id="labPicDrop" tabindex="0"><input type="file" id="labPic" hidden accept="${md.accept}"><span class="lab-drop-ic">${icon(md.icon)}</span><b>Drop a ${md.one} here or click to choose one</b><span class="small muted">It answers which category it belongs to, and how sure it is.</span></label>
+          ${md.type === "audio" ? `<div class="row wrap gap-s" style="margin-top:10px"><button class="btn sm" type="button" id="labRec">${icon("mic")} Record 3 seconds</button><span class="small muted" id="labRecNote">Uses your microphone; nothing leaves this computer.</span></div>` : ""}<div id="labForm"></div>`
         : `<form data-form="lab-predict" id="labForm" class="lab-form">${m.inputs.map(inputField).join("")}
         <div class="row" style="grid-column:1/-1"><button class="btn primary" type="submit">${icon("play")} Predict ${esc(r.target)}</button></div></form>`}
         <div id="labOut" class="lab-out" aria-live="polite"></div></div>
@@ -366,21 +390,21 @@ function paintModel() {
     </div>
     ${m.curve && Object.keys(m.curve).length ? `<div class="card"><h3>📉 How fast each one learned</h3><div id="labCurve"></div></div>` : ""}
     <div class="grid g-2 lab-grid">
-      <div class="card"><h3>🔎 What it pays attention to</h3><div id="labImp"></div><p class="small muted" style="margin:10px 0 0">${img ? "How much worse it gets when one kind of feature (shape, colours, edges) is shuffled between pictures." : "How much worse it gets when a column's values are shuffled between rows."}</p></div>
+      <div class="card"><h3>🔎 What it pays attention to</h3><div id="labImp"></div><p class="small muted" style="margin:10px 0 0">${img ? `How much worse it gets when one kind of feature (${md.feat}) is shuffled between ${md.many}.` : "How much worse it gets when a column's values are shuffled between rows."}</p></div>
       ${task === "classification" && classes.length <= 12 && r.test.confusion ? `<div class="card"><h3>🧩 Where it gets confused</h3><div id="labConf"></div></div>` : `<div class="card"><h3>📏 Errors</h3>${errorsHTML(r)}</div>`}
     </div>
     <div class="grid g-2 lab-grid">
-      <div class="card"><h3>${icon("table")} ${img ? "Sort a whole folder of pictures" : "Predict a whole file"}</h3><p class="small muted">${img ? "Upload a .zip of pictures. You get back a spreadsheet (CSV) with the category of each one."
+      <div class="card"><h3>${icon("table")} ${img ? `Sort a whole folder of ${md.many}` : "Predict a whole file"}</h3><p class="small muted">${img ? `Upload a .zip of ${md.many}. You get back a spreadsheet (CSV) with the category of each one.`
         : `Upload an Excel or CSV file with the same columns (the ${esc(r.target)} column may be missing). You get it back as CSV with a prediction on every row.`}</p>
         <label class="btn"><input type="file" id="labBatch" hidden accept="${img ? ".zip" : ".csv,.tsv,.json,.jsonl,.txt,.xlsx,.xlsm"}">${icon("upload")} Choose a file…</label></div>
-      <div class="card"><h3>${icon("link")} Use it from your own code</h3><pre class="lab-pre small">${esc(img ? `curl -s ${location.origin}/api/lab/models/${m.id}/predict_image \\
-  --data-binary @photo.jpg` : curlExample(m))}</pre></div>
+      <div class="card"><h3>${icon("link")} Use it from your own code</h3><pre class="lab-pre small">${esc(img ? `curl -s "${location.origin}/api/lab/models/${m.id}/predict_media?filename=${{ image: "photo.jpg", audio: "sound.wav", video: "clip.mp4" }[m.type]}" \\
+  --data-binary @${{ image: "photo.jpg", audio: "sound.wav", video: "clip.mp4" }[m.type]}` : curlExample(m))}</pre></div>
     </div></div>`;
   barBoard($("#labBoard"), r.leaderboard.filter((b) => b.learner !== "baseline"), task, r.winner);
   LAB.redraw = () => $("#labCurve") && lineChart($("#labCurve"), Object.entries(m.curve).filter(([k]) => k !== "baseline").map(([k, pts]) => ({ key: k, name: LEARNERS[k]?.label || k, color: seriesVar(k), pts })),
     { task, baseline: scoreOf(task, r.leaderboard.find((b) => b.learner === "baseline")?.valid), title: `Validation ${scoreName(task)} over time` });
   LAB.redraw();
-  importanceBars($("#labImp"), r.importance);
+  importanceBars($("#labImp"), r.importance, r.importance_note);
   if ($("#labConf")) confusion($("#labConf"), r.test.confusion, classes);
   $("#labBatch").onchange = (e) => batchPredict(e.target.files[0]);
   if (img) {
@@ -390,17 +414,58 @@ function paintModel() {
     ["dragenter", "dragover"].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.add("over"); }));
     ["dragleave", "drop"].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
     drop.addEventListener("drop", (e) => { const f = e.dataTransfer.files[0]; if (f) predictPicture(f); });
+    if ($("#labRec")) $("#labRec").onclick = recordSound;
   }
 }
-async function predictPicture(f) {
-  const out = $("#labOut"), url = URL.createObjectURL(f);
+/* sounds are turned into a 16 kHz WAV in the browser when it can decode them (MP3, OGG, M4A… or a recording), so
+   the server needs no ffmpeg for them */
+async function toWav(blob, seconds = 30) {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return null;
+  const ctx = new AC();
+  try {
+    const buf = await ctx.decodeAudioData(await blob.arrayBuffer());
+    const rate = 16000, n = Math.min(Math.ceil(buf.duration * rate), seconds * rate);
+    const off = new OfflineAudioContext(1, Math.max(1, n), rate), src = off.createBufferSource();
+    src.buffer = buf; src.connect(off.destination); src.start();
+    const x = (await off.startRendering()).getChannelData(0);
+    const out = new DataView(new ArrayBuffer(44 + x.length * 2)), str = (o, t) => [...t].forEach((c, i) => out.setUint8(o + i, c.charCodeAt(0)));
+    str(0, "RIFF"); out.setUint32(4, 36 + x.length * 2, true); str(8, "WAVEfmt "); out.setUint32(16, 16, true); out.setUint16(20, 1, true); out.setUint16(22, 1, true);
+    out.setUint32(24, rate, true); out.setUint32(28, rate * 2, true); out.setUint16(32, 2, true); out.setUint16(34, 16, true); str(36, "data"); out.setUint32(40, x.length * 2, true);
+    for (let i = 0; i < x.length; i++) out.setInt16(44 + i * 2, Math.max(-1, Math.min(1, x[i])) * 32767, true);
+    return new Blob([out], { type: "audio/wav" });
+  } catch (e) { return null; } finally { ctx.close?.(); }
+}
+async function recordSound() {
+  const btn = $("#labRec"), note = $("#labRecNote");
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) { note.textContent = "This browser cannot record sound."; return; }
+  let stream;
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); } catch (e) { note.textContent = "The microphone was not allowed."; return; }
+  const rec = new MediaRecorder(stream), parts = [];
+  rec.ondataavailable = (e) => parts.push(e.data);
+  rec.onstop = () => { stream.getTracks().forEach((t) => t.stop()); btn.disabled = false; note.textContent = "Uses your microphone; nothing leaves this computer.";
+    const blob = new Blob(parts, { type: rec.mimeType || "audio/webm" }); blob.name = "recording.webm"; predictPicture(blob, "recording"); };
+  btn.disabled = true; rec.start();
+  let left = 3; note.textContent = `Recording… ${left}`;
+  const tick = setInterval(() => { left -= 1; if (left > 0) note.textContent = `Recording… ${left}`; else { clearInterval(tick); rec.stop(); } }, 1000);
+}
+async function predictPicture(f, label) {
+  const md = MEDIA_OF_TYPE[LAB.model.type] || MEDIA.images, out = $("#labOut"), url = URL.createObjectURL(f);
   out.innerHTML = `<div class="skeleton" style="height:90px"></div>`;
   try {
-    const r = await fetch(`/api/lab/models/${LAB.model.id}/predict_image`, { method: "POST", body: f });
+    let body = f, name = f.name || `${md.one}`;
+    if (md.type === "audio" && !/\.wav$/i.test(name)) {
+      const wav = await toWav(f);
+      if (wav) { body = wav; name = name.replace(/\.[^.]+$/, "") + ".wav"; }
+    }
+    const r = await fetch(`/api/lab/models/${LAB.model.id}/predict_media?filename=${encodeURIComponent(name)}`, { method: "POST", body });
     const d = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(typeof d.detail === "string" ? d.detail : "Could not read that picture");
+    if (!r.ok) throw new Error(typeof d.detail === "string" ? d.detail : `Could not read that ${md.one}`);
     const p = d.prediction;
-    out.innerHTML = `<div class="lab-pic-answer"><img src="${url}" alt="The picture you chose"><div class="lab-answer grow"><span class="muted small">This looks like</span><b>${esc(p.prediction)}</b><small>${Math.round(p.confidence * 100)}% sure · ${fmtSec(d.seconds)}</small></div></div>
+    const shown = md.type === "audio" ? `<audio controls src="${url}" aria-label="The sound you chose"></audio>`
+      : md.type === "video" && !/\.gif$/i.test(name) ? `<video src="${url}" muted autoplay loop playsinline aria-label="The video you chose"></video>`
+      : `<img src="${url}" alt="The ${md.one} you chose">`;
+    out.innerHTML = `<div class="lab-pic-answer${md.type === "audio" ? " audio" : ""}">${shown}<div class="lab-answer grow"><span class="muted small">${label === "recording" ? "Your recording sounds like" : md.looks}</span><b>${esc(p.prediction)}</b><small>${Math.round(p.confidence * 100)}% sure · ${fmtSec(d.seconds)}</small></div></div>
       <div class="lab-probs">${p.top.map((t, i) => `<div class="lab-prob"><span class="nm">${esc(t.label)}</span><span class="track"><span style="width:${Math.max(1, t.p * 100)}%;${i ? "opacity:.55" : ""}"></span></span><span class="v">${(t.p * 100).toFixed(1)}%</span></div>`).join("")}</div>`;
   } catch (e) { out.innerHTML = `<div class="lab-err">${esc(e.message)}</div>`; }
 }
@@ -578,8 +643,8 @@ function barBoard(el, rows, task, winners) {
     ${winners.length > 1 ? `<p class="small muted" style="margin:8px 0 0">The winner is a blend: it averages ${winners.map((k) => LEARNERS[k]?.label || k).join(", ")}.</p>` : ""}`;
   hoverTips(el);
 }
-function importanceBars(el, imp) {
-  if (!imp?.length) { el.innerHTML = `<p class="muted small">Not enough rows to measure this.</p>`; return; }
+function importanceBars(el, imp, note) {
+  if (!imp?.length) { el.innerHTML = `<p class="muted small">${note === "no time" ? "There was no time left to measure this. Train again with <b>Balanced</b> to see it." : "Not enough rows to measure this."}</p>`; return; }
   const top = imp.slice(0, 10), mx = Math.max(...top.map((i) => i.share), 1e-9);
   el.innerHTML = `<div class="lab-bars">${top.map((i) => `<div class="lab-barrow" tabindex="0" data-tip="${esc(`${i.column}: ${(i.share * 100).toFixed(1)}% of the total effect`)}"><span class="nm">${esc(i.column)}</span><span class="track"><span style="width:${Math.max(0.5, (i.share / mx) * 100)}%;background:var(--s1)"></span></span><span class="v">${Math.round(i.share * 100)}%</span></div>`).join("")}</div>`;
   hoverTips(el);

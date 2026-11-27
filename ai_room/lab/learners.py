@@ -248,6 +248,7 @@ class OneShot(Learner):
 
 # ------------------------------------------------------------------ gradient-boosted trees
 _POOL = None
+HIST_THREADS = 0          # 0: as many as there are cores (up to 8); 1: no extra threads (set inside parallel learners)
 
 
 def _pool():
@@ -364,7 +365,7 @@ def _hist(loc, Xa, gT, hT, L, B, h_const):
         else:
             H = np.stack([np.bincount(flat, weights=np.tile(hT[k], df), minlength=tot) for k in range(K)], -1).reshape(df, L, B, K)
         return G, H, C
-    res = list(_pool().map(one, range(df))) if df > 1 else [one(0)]
+    res = list(_pool().map(one, range(df))) if df > 1 and HIST_THREADS != 1 else [one(j) for j in range(df)]
     C = np.stack([r[0] for r in res]).reshape(df, L, B).astype(np.float64)
     G = np.stack([r[1] for r in res]).reshape(df, L, B, K)
     H = np.stack([r[2] for r in res]).reshape(df, L, B, K)
@@ -490,7 +491,7 @@ class Boosted(Learner):
         patience = self.patience or (50 if n < 5000 else 30)
         min_leaf = int(np.clip(n / 300, 3, 20))
         self.plain, self.bundles = find_bundles(Xtr.dense)
-        bins = self.bins or (127 if n >= 5000 else 63)
+        bins = self.bins or (127 if n >= 5000 else 63 if n >= 1000 else 31)     # few rows cannot use fine bins
         self.edges = make_bins(Xtr.dense[:, self.plain], bins, rng) if self.plain else []
         Xb, Xvb = self._bin(Xtr.dense), self._bin(Xva.dense)
         d = Xb.shape[0]
@@ -509,12 +510,20 @@ class Boosted(Learner):
         self.init = init.astype(F32)
         F = np.tile(init, (n, 1))
         Fv = np.tile(init, (len(yva), 1))
+        # the test rows (if given) are scored tree by tree as well, so the scores are ready the moment the time is up;
+        # scoring hundreds of trees afterwards on millions of rows could take longer than is left
+        Xe = getattr(self, "extra_eval", None)
+        Xeb = self._bin(Xe.dense) if Xe is not None else None
+        Fe = np.tile(init, (Xe.n, 1)) if Xe is not None else None
+        snap = None
         trees_f, trees_t, trees_v = [], [], []
         self.gain = np.zeros(d)
         best, last_gain, anchor = (math.inf, 0, -math.inf), 0, math.inf
         sub = self.subsample or (1.0 if n < 2000 else 0.85 if n < 20000 else 0.6 if n < 100000 else 0.4)
         m = min(n, max(2, int(n * sub)), 80000)
         dk = max(1, int(round(d * self.colsample))) if d > 4 else d
+        if dk > 256:                 # wide data (pictures, sounds, videos): a few hundred columns per tree is plenty, and far quicker
+            dk = 256
         t_report = 0.0
         for r in range(self.max_rounds):
             if r and _stopped(deadline, stop):
@@ -531,11 +540,15 @@ class Boosted(Learner):
             val = (val * lr).astype(F32)
             F += val[tree_leaves(feat, thr, Xb, depth)]
             Fv += val[tree_leaves(feat, thr, Xvb, depth)]
+            if Fe is not None:
+                Fe += val[tree_leaves(feat, thr, Xeb, depth)]
             trees_f.append(feat); trees_t.append(thr); trees_v.append(val)
             out = self._out(Fv)
             vl = quick_loss(task, out, yva)
             if vl < best[0]:
                 best = (vl, r + 1, quick_score(task, out, yva))
+                if Fe is not None:
+                    snap = (out, Fe.copy())
             if vl < anchor * (1 - 2e-3):             # only real progress (0.2% better) resets the patience clock
                 anchor, last_gain = vl, r + 1
             if r + 1 - last_gain > patience:
@@ -549,6 +562,8 @@ class Boosted(Learner):
         self.feat = np.stack(trees_f[:keep])
         self.thr = np.stack(trees_t[:keep])
         self.val = np.stack(trees_v[:keep])
+        if snap is not None:
+            self.done_preds = (snap[0], self._out(snap[1]))     # validation and test answers of the kept trees
         report(step=keep, total=keep, val=best[2], note=f"kept the best {keep} trees")
 
     def raw(self, X: XData) -> np.ndarray:
@@ -699,7 +714,7 @@ class Neural(Learner):
             perm = rng.permutation(n)
             tl, tn = 0.0, 0
             for s in range(0, n, batch):
-                if step and step % 16 == 0 and time.perf_counter() > deadline:
+                if step and step % 4 == 0 and time.perf_counter() > deadline:
                     break                                   # out of time: keep what this epoch learned so far
                 idx = perm[s:s + batch]
                 xb, yb = Xtr.take(idx), yt[idx]
@@ -787,4 +802,74 @@ def linear() -> Neural:
                   blurb="One weight per feature (logistic or linear regression). Fast and hard to fool, but it can only draw straight lines.")
 
 
-KINDS = {"baseline": Baseline, "oneshot": OneShot, "boost": Boosted, "mlp": Neural, "linear": Neural}
+# ------------------------------------------------------------------ word counts (complement naive Bayes)
+class WordCounts(Learner):
+    """Complement naive Bayes (Rennie et al., 2003) on the hashed words: for each answer, how often every word
+    appears in the rows of all the *other* answers. One counting pass, no epochs — strong and instant for text."""
+    key, label = "words", "Word counts"
+    blurb = "Counts which words go with each answer, in a single pass (complement naive Bayes). Made for text; ready almost at once."
+
+    def usable(self, X):
+        return X.has_text
+
+    def _scores(self, X: XData) -> np.ndarray:
+        K = self.W.shape[1]
+        if not X.has_text or not len(X.sp_indices):
+            return np.zeros((X.n, K), F32)
+        cols = X.sp_indices & ((1 << self.bits) - 1)
+        rows = np.repeat(np.arange(X.n), np.diff(X.sp_indptr))
+        Wt = getattr(self, "_Wt", None)
+        if Wt is None or Wt.shape[1] != self.W.shape[0]:
+            Wt = self._Wt = np.ascontiguousarray(self.W.T)
+        return -np.stack([np.bincount(rows, weights=Wt[k][cols] * X.sp_data, minlength=X.n) for k in range(K)], 1).astype(F32)
+
+    def fit(self, Xtr, ytr, Xva, yva, task, deadline, report, stop):
+        if task.kind != "classification":
+            raise ValueError("word counts only predict categories")
+        self.task = task
+        K = task.classes
+        self.bits = int(min(18, max(12, math.floor(math.log2((1 << 24) / max(K, 1))))))
+        D = 1 << self.bits
+        rows = np.repeat(np.arange(Xtr.n), np.diff(Xtr.sp_indptr))
+        cols = Xtr.sp_indices & (D - 1)
+        cls = ytr[rows]
+        F = np.bincount(cls * D + cols, weights=Xtr.sp_data, minlength=K * D).reshape(K, D)
+        comp = F.sum(0)[None, :] - F                          # word weight in all the other answers
+        best = None
+        for alpha in (0.03, 0.1, 0.3, 1.0):
+            theta = (comp + alpha) / (comp.sum(1, keepdims=True) + alpha * D)
+            W = np.log(theta)
+            W /= np.abs(W).sum(1, keepdims=True)               # weight normalisation, as in the paper
+            self.W = np.ascontiguousarray(W.T).astype(F32)     # (D, K)
+            self._Wt = None
+            s = self._scores(Xva)
+            acc = float((s.argmax(1) == yva).mean())
+            if best is None or acc > best[0]:
+                best = (acc, alpha, self.W)
+            report(step=len([a for a in (0.03, 0.1, 0.3, 1.0) if a <= alpha]), total=4, val=best[0], note=f"smoothing {alpha:g}")
+        _, self.alpha, self.W = best
+        raw = self._scores(Xva)
+        sd = float(raw.std()) or 1.0
+        losses = [(log_loss(softmax(raw * (t / sd)), yva), t / sd) for t in np.logspace(-1, 1.6, 30)]
+        self.temp = float(min(losses)[1])
+
+    def predict(self, X):
+        return softmax(self._scores(X) * self.temp)
+
+    def __getstate__(self):          # the transposed copy is rebuilt when needed; don't send it between processes
+        d = dict(self.__dict__)
+        d.pop("_Wt", None)
+        return d
+
+    def state(self):
+        return {"task": vars(self.task), "bits": self.bits, "alpha": self.alpha, "temp": self.temp}, {"W": self.W}
+
+    @classmethod
+    def from_state(cls, meta, arrays):
+        m = cls()
+        m.task, m.bits, m.alpha, m.temp = Task(**meta["task"]), meta["bits"], meta["alpha"], meta["temp"]
+        m.W = arrays["W"]
+        return m
+
+
+KINDS = {"baseline": Baseline, "oneshot": OneShot, "boost": Boosted, "mlp": Neural, "linear": Neural, "words": WordCounts}

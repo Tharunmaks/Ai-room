@@ -1,9 +1,9 @@
 /* ───────────────────────────── Lab ───────────────────────────── */
 /* Chart series colours (validated for colour-vision deficiency on both surfaces). Learners keep their colour everywhere. */
-:root { --s1: #338ced; --s2: #e76624; --s3: #00a888; --s4: #d28e05; --chart-grid: rgba(255, 255, 255, .08); --chart-ref: rgba(255, 255, 255, .38); }
-:root[data-theme="light"] { --s1: #257de0; --s2: #f47230; --s3: #00b894; --s4: #f2a600; --chart-grid: rgba(40, 45, 80, .1); --chart-ref: rgba(40, 45, 80, .45); }
+:root { --s1: #338ced; --s2: #e76624; --s3: #00a888; --s4: #d28e05; --s5: #e24d8b; --chart-grid: rgba(255, 255, 255, .08); --chart-ref: rgba(255, 255, 255, .38); }
+:root[data-theme="light"] { --s1: #257de0; --s2: #f47230; --s3: #00b894; --s4: #f2a600; --s5: #ee7fac; --chart-grid: rgba(40, 45, 80, .1); --chart-ref: rgba(40, 45, 80, .45); }
 @media (prefers-color-scheme: light) {
-  :root:not([data-theme]) { --s1: #257de0; --s2: #f47230; --s3: #00b894; --s4: #f2a600; --chart-grid: rgba(40, 45, 80, .1); --chart-ref: rgba(40, 45, 80, .45); }
+  :root:not([data-theme]) { --s1: #257de0; --s2: #f47230; --s3: #00b894; --s4: #f2a600; --s5: #ee7fac; --chart-grid: rgba(40, 45, 80, .1); --chart-ref: rgba(40, 45, 80, .45); }
 }
 
 .lab { display: grid; grid-template-columns: 320px minmax(0, 1fr); gap: 18px; align-items: start; }
@@ -163,4 +163,6 @@ button.lab-col { cursor: pointer; }
 .lab-sheet { display: block; max-width: 100%; border-radius: 12px; border: 1px solid var(--line); image-rendering: auto; margin: 4px 0; }
 .lab-pic-drop { padding: 18px; }
 .lab-pic-answer { display: flex; gap: 14px; align-items: center; }
-.lab-pic-answer img { width: 96px; height: 96px; object-fit: cover; border-radius: 12px; border: 1px solid var(--line); flex: none; }
+.lab-pic-answer img, .lab-pic-answer video { width: 96px; height: 96px; object-fit: cover; border-radius: 12px; border: 1px solid var(--line); flex: none; }
+.lab-pic-answer.audio { flex-direction: column; align-items: stretch; }
+.lab-pic-answer audio { width: 100%; height: 40px; flex: none; }

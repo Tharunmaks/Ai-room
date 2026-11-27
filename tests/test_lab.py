@@ -304,8 +304,8 @@ def test_api_text_model_writes_and_answers(lab):
 
 def test_api_samples_errors_and_safety(lab):
     info = lab.get("/api/lab/info").json()
-    assert [s["key"] for s in info["speeds"]] == ["fast", "balanced", "thorough"] and info["speeds"][0]["label"] == "10 min per GB"
-    assert info["max_bytes"] == 5 * 10**12 and info["max_label"] == "5.0 TB" and info["seconds_per_mb"] == 0.6
+    assert [s["key"] for s in info["speeds"]] == ["fast", "balanced", "thorough"] and info["speeds"][0]["label"] == "5 min per GB"
+    assert info["max_bytes"] == 5 * 10**12 and info["max_label"] == "5.0 TB" and info["seconds_per_mb"] == 0.3 and info["min_seconds"] == 0.5
     assert {s["key"] for s in info["samples"]} == set(samples.SAMPLES)
     sp = lab.post("/api/lab/samples/spirals").json()
     assert sp["rows"] == 1200 and sp["target"] == "arm" and sp["sample"] == "spirals"
@@ -341,14 +341,14 @@ def test_cli_trains_predicts_and_lists(tmp_path, capsys):
 
 
 # ------------------------------------------------------------------ size limits and the 1 second per MB budget
-def test_budget_is_ten_minutes_per_gigabyte():
+def test_budget_is_five_minutes_per_gigabyte():
     from ai_room.lab.automl import RATE_LABEL, budget_for
-    assert RATE_LABEL == "10 min per GB"
-    assert budget_for("fast", 1e9) == pytest.approx(600)                                  # 1 GB → 10 minutes
-    assert budget_for("fast", 0) == 1.0 and budget_for("fast", 1_000_000) == 1.0           # at least 1 s
-    assert budget_for("fast", 7_500_000) == pytest.approx(4.5) and budget_for("quick", 50e6) == pytest.approx(30)
-    assert budget_for("fast", 5e12) == pytest.approx(3_000_000)                           # 5 TB → 50,000 minutes at most
-    assert budget_for("balanced", 1e6) == 30 and budget_for("balanced", 100e6) == pytest.approx(60)
+    assert RATE_LABEL == "5 min per GB"
+    assert budget_for("fast", 1e9) == pytest.approx(300)                                  # 1 GB → 5 minutes
+    assert budget_for("fast", 0) == 0.5 and budget_for("fast", 1_000_000) == 0.5           # at least half a second
+    assert budget_for("fast", 7_500_000) == pytest.approx(2.25) and budget_for("quick", 50e6) == pytest.approx(15)
+    assert budget_for("fast", 5e12) == pytest.approx(1_500_000)                           # 5 TB → 25,000 minutes at most
+    assert budget_for("balanced", 1e6) == 30 and budget_for("balanced", 200e6) == pytest.approx(60)
 
 
 def test_upload_streams_to_disk_and_enforces_the_size_cap_and_free_space(lab, monkeypatch):
@@ -368,17 +368,17 @@ def test_upload_streams_to_disk_and_enforces_the_size_cap_and_free_space(lab, mo
     monkeypatch.undo()
     assert lab.get("/api/lab/datasets").json() == []                 # nothing half-written is left behind
     up = lab.post("/api/lab/datasets?filename=ok.csv", content=body).json()
-    assert up["rows"] == 200 and up["rows_exact"] and up["budget_seconds"] == 1.0
+    assert up["rows"] == 200 and up["rows_exact"] and up["budget_seconds"] == 0.5
 
 
-def test_a_training_job_finishes_within_ten_minutes_per_gigabyte(lab):
+def test_a_training_job_finishes_within_five_minutes_per_gigabyte(lab):
     rng = np.random.default_rng(3)
     X = rng.normal(size=(40_000, 6))
     y = np.where(X[:, 0] * X[:, 1] + X[:, 2] > 0, "yes", "no")
     body = table_bytes([f"f{i}" for i in range(6)] + ["label"], [[f"{v:.5f}" for v in x] + [t] for x, t in zip(X, y)])
     up = lab.post("/api/lab/datasets?filename=mid.csv", content=body).json()
     budget = up["budget_seconds"]
-    assert budget == pytest.approx(len(body) / 1e6 * 0.6, abs=0.01) and budget > 1.2
+    assert budget == pytest.approx(len(body) / 1e6 * 0.3, abs=0.01) and budget > 0.6
     j = wait_job(lab, lab.post("/api/lab/train", json={"dataset": up["id"]}).json()["id"])
     assert j["status"] == "done" and j["budget"] == pytest.approx(budget, abs=0.01)
     assert j["seconds"] <= budget * 1.15 + 0.3, (j["seconds"], budget)
@@ -584,3 +584,143 @@ def test_text_models_saved_before_column_hashing_still_predict(tmp_path):
     old = Trained.load(tmp_path / "v2")
     p = old.predict([{"review": "The kettle is great. Five stars."}])[0]
     assert p["prediction"] in ("positive", "negative") and 0 < p["confidence"] <= 1
+
+
+# ------------------------------------------------------------------ sounds and videos
+def wav_bytes(x, rate=16000, width=2, channels=1):
+    import wave
+    x = np.clip(np.asarray(x, np.float64), -1, 1)
+    if channels > 1:
+        x = np.repeat(x[:, None], channels, 1).ravel()
+    if width == 1:
+        pcm = ((x * 127) + 128).astype(np.uint8).tobytes()
+    elif width == 2:
+        pcm = (x * 32767).astype("<i2").tobytes()
+    elif width == 3:
+        v = (x * 8388607).astype("<i4")
+        pcm = np.stack([v & 255, (v >> 8) & 255, (v >> 16) & 255], 1).astype(np.uint8).tobytes()
+    else:
+        pcm = (x * 2147483647).astype("<i4").tobytes()
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(width)
+        w.setframerate(rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+def test_wav_files_of_every_common_kind_are_read_at_16_khz():
+    from ai_room.lab import media
+    t = np.arange(22050) / 22050
+    tone = 0.5 * np.sin(2 * np.pi * 440 * t)                           # one second of A
+    for width in (1, 2, 3, 4):
+        for channels in (1, 2):
+            x = media.decode_audio(wav_bytes(tone, 22050, width, channels), "a.wav")
+            assert abs(len(x) - 16000) <= 1 and 0.4 < np.abs(x).max() < 0.6, (width, channels)
+            spec = np.abs(np.fft.rfft(x))
+            assert abs(np.argmax(spec) * 16000 / len(x) - 440) < 3          # still the same note after resampling
+    f = media.audio_features(media.decode_audio(wav_bytes(tone), "a.wav"))
+    assert f.shape == (media.AUDIO_FEATURES,) == (212,) and np.isfinite(f).all()
+    assert media.audio_features(np.zeros(10, np.float32)).shape == (212,)       # a tiny, silent clip still works
+    with pytest.raises(DataError):
+        media.decode_audio(b"RIFF not really", "broken.wav")
+
+
+def test_zips_of_sounds_videos_and_pictures_are_told_apart():
+    from ai_room.lab import media
+    z = lambda raw: __import__("zipfile").ZipFile(io.BytesIO(raw))
+    assert media.sniff_zip(z(samples.sounds(per_class=3))) == "sounds"
+    assert media.sniff_zip(z(samples.motions(per_class=3, frames=4))) == "videos"
+    assert media.sniff_zip(z(samples.shapes(per_class=3))) == "images"
+    assert media.zip_kind(["a/1.mp4", "b/2.mov", "b/3.webm"]) == "video"
+    assert media.zip_kind(["a/1.wav", "b/2.mp3", "notes.txt"]) == "audio"
+    assert media.zip_kind(["a/1.csv", "b/2.csv"]) is None
+    assert sniff_kind("s.zip", samples.sounds(per_class=3)) == "sounds"
+
+
+def test_sounds_become_numbers_and_a_sound_model_learns_them(tmp_path):
+    from ai_room.lab import media
+    path = tmp_path / "sounds.zip"
+    path.write_bytes(samples.sounds(per_class=30))
+    info = media.describe(path, "audio")
+    assert info == {"classes": {"chirps": 30, "chords": 30, "drums": 30, "whistles": 30}, "items": 120, "media": "audio"}
+    t = media.load_zip(path, "audio")
+    assert t.n == 120 and len(t.columns) == media.AUDIO_FEATURES + 1 and t.columns[-1] == "category"
+    m = train_table(t, None, "category", budget=6, image="audio")
+    r = m.report
+    assert r["media"] == "audio" and r["audio"]["groups"] == list(media.AUDIO_GROUPS)
+    assert r["test"]["accuracy"] >= 0.8 > r["baseline_test"]["accuracy"]
+    assert {i["column"] for i in r["importance"]} <= set(media.AUDIO_GROUPS)
+    whistle = media.decode_audio(__import__("zipfile").ZipFile(path).read("sounds/whistles/whistle_000.wav"), "w.wav")
+    p = m.predict(media.media_table("audio", [("w.wav", wav_bytes(whistle))]))[0]
+    assert p["prediction"] in info["classes"] and abs(sum(x["p"] for x in p["top"]) - 1) < 1e-5
+    png = media.preview_sheet(path, "audio")
+    assert png[:4] == b"\x89PNG"
+
+
+def test_animated_gifs_become_look_and_motion_and_a_video_model_learns_them(tmp_path):
+    from ai_room.lab import media
+    path = tmp_path / "motions.zip"
+    path.write_bytes(samples.motions(per_class=25, frames=8))
+    assert media.describe(path, "video")["classes"] == {"bouncing": 25, "growing": 25, "sliding": 25, "spinning": 25}
+    raw = __import__("zipfile").ZipFile(path).read("motions/sliding/sliding_000.gif")
+    frames, sound = media.decode_video(raw, "a.gif")
+    assert len(frames) == 8 and sound is None
+    f = media.video_features(frames, sound)
+    assert f.shape == (media.VIDEO_FEATURES,) == (1172,) and not f[-media.AUDIO_FEATURES - 1:].any()   # no sound: zeros
+    still = media.video_features(frames[:1] * 8, None)
+    assert np.abs(still[936:936 + media.MOTION]).max() == 0                     # nothing moves: no motion
+    t = media.load_zip(path, "video")
+    m = train_table(t, None, "category", budget=6, image="video")
+    r = m.report
+    assert r["media"] == "video" and r["test"]["accuracy"] >= 0.7 > r["baseline_test"]["accuracy"]
+    assert media.preview_sheet(path, "video")[:4] == b"\x89PNG"
+
+
+needs_ffmpeg = pytest.mark.skipif(not __import__("shutil").which("ffmpeg"), reason="ffmpeg is not installed")
+
+
+@needs_ffmpeg
+def test_mp3_sounds_and_mp4_videos_with_a_sound_track_are_read_through_ffmpeg(tmp_path):
+    import subprocess
+    from ai_room.lab import media
+    t = np.arange(16000) / 16000
+    (tmp_path / "a.wav").write_bytes(wav_bytes(0.5 * np.sin(2 * np.pi * 660 * t)))
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", str(tmp_path / "a.wav"), str(tmp_path / "a.mp3")], check=True)
+    x = media.decode_audio((tmp_path / "a.mp3").read_bytes(), "a.mp3")
+    assert 15000 < len(x) < 17500 and abs(np.argmax(np.abs(np.fft.rfft(x))) * 16000 / len(x) - 660) < 5
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=10:duration=2", "-f", "lavfi",
+                    "-i", "sine=frequency=440:duration=2", "-shortest", "-pix_fmt", "yuv420p", str(tmp_path / "v.mp4")], check=True)
+    frames, sound = media.decode_video((tmp_path / "v.mp4").read_bytes(), "v.mp4")
+    assert len(frames) == media.FRAMES and frames[0].size == (64, 64) and sound is not None and len(sound) > 16000
+    f = media.video_features(frames, sound)
+    assert f[-1] == 1.0 and np.abs(f[936:936 + media.MOTION]).max() > 0     # it has sound, and things move
+
+
+def test_api_learns_sounds_and_videos_and_answers_about_new_ones(lab):
+    sp = lab.post("/api/lab/samples/sounds").json()
+    assert sp["kind"] == "sounds" and sp["items"] == 400 and sp["media"] == "audio" and len(sp["classes"]) == 4
+    assert lab.get(f"/api/lab/datasets/{sp['id']}/preview.png").content[:4] == b"\x89PNG"
+    j = wait_job(lab, lab.post("/api/lab/train", json={"dataset": sp["id"]}).json()["id"])
+    assert j["status"] == "done", j
+    card = lab.get(f"/api/lab/models/{j['model']}").json()
+    assert card["type"] == "audio" and card["score"]["accuracy"] > 0.8
+    t = np.arange(8000) / 8000
+    r = lab.post(f"/api/lab/models/{j['model']}/predict_media?filename=mine.wav", content=wav_bytes(np.sin(2 * np.pi * 600 * t), 8000)).json()
+    assert r["media"] == "audio" and r["prediction"]["prediction"] in sp["classes"]
+    assert lab.post(f"/api/lab/models/{j['model']}/predict_media?filename=x.wav", content=b"nope").status_code == 400
+    out = lab.post(f"/api/lab/models/{j['model']}/predict_file?filename=more.zip", content=samples.sounds(per_class=2, seed=5))
+    rows = list(csv.reader(io.StringIO(out.text)))
+    assert out.status_code == 200 and rows[0] == ["file", "predicted category", "confidence"] and len(rows) == 9
+    assert lab.post("/api/lab/datasets?filename=bark.wav", content=wav_bytes(t)).status_code == 400   # one sound: explain zips
+
+    vp = lab.post("/api/lab/samples/motions").json()
+    assert vp["kind"] == "videos" and vp["items"] == 320 and vp["media"] == "video"
+    j = wait_job(lab, lab.post("/api/lab/train", json={"dataset": vp["id"]}).json()["id"])
+    assert j["status"] == "done", j
+    card = lab.get(f"/api/lab/models/{j['model']}").json()
+    assert card["type"] == "video" and card["score"]["accuracy"] > 0.6
+    gif = __import__("zipfile").ZipFile(io.BytesIO(samples.motions(per_class=1, frames=6, seed=3))).read("motions/bouncing/bouncing_000.gif")
+    r = lab.post(f"/api/lab/models/{j['model']}/predict_media?filename=clip.gif", content=gif).json()
+    assert r["media"] == "video" and r["prediction"]["prediction"] in vp["classes"]
