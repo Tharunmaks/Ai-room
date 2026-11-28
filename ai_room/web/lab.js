@@ -37,7 +37,7 @@ const LAB = {
 try { LAB.sel = JSON.parse(store.get("lab.sel", "null")); } catch (e) { LAB.sel = null; }
 const LEARNERS = {
   baseline: { label: "Baseline (no learning)", s: 0 }, oneshot: { label: "One-shot net", s: 1 }, linear: { label: "Linear model", s: 2 },
-  boost: { label: "Boosted trees", s: 3 }, mlp: { label: "Neural network", s: 4 }, words: { label: "Word counts", s: 5 },
+  boost: { label: "Boosted trees", s: 3 }, lgbm: { label: "LightGBM", s: 3 }, mlp: { label: "Neural network", s: 4 }, words: { label: "Word counts", s: 5 },
 };
 const KIND_LABEL = { number: "number", category: "category", text: "text", date: "date", id: "ignored · ID", constant: "ignored · constant", empty: "ignored · empty" };
 const fmtBytes = (b) => (b >= 1e12 ? `${(b / 1e12).toFixed(2)} TB` : b >= 1e9 ? `${(b / 1e9).toFixed(2)} GB` : b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : b >= 1e3 ? `${Math.round(b / 1e3)} KB` : `${b} B`);
@@ -88,7 +88,9 @@ async function renderLab() {
 }
 function paintStats() {
   const el = $("#labStats"); if (!el) return;
-  el.innerHTML = `<span class="chip">${icon("brain")} ${plural(LAB.models.length, "model")}</span><span class="chip">${icon("table")} ${plural(LAB.datasets.length, "dataset")}</span><span class="chip" title="Training uses all CPU cores, no GPU needed">⚙️ ${LAB.info.cpus} CPU cores</span><span class="chip on" title="The fast setting gives the whole job ${esc(LAB.info.rate_label)} of data (at least ${LAB.info.min_seconds} s); the learners run side by side, one per core">⚡ ${esc(LAB.info.rate_label)}</span>`;
+  el.innerHTML = `<span class="chip">${icon("brain")} ${plural(LAB.models.length, "model")}</span><span class="chip">${icon("table")} ${plural(LAB.datasets.length, "dataset")}</span><span class="chip" title="Training uses all CPU cores, no GPU needed">⚙️ ${LAB.info.cpus} CPU cores</span><span class="chip on" title="The fast setting gives the whole job ${esc(LAB.info.rate_label)} of data (at least ${LAB.info.min_seconds} s); ${LAB.info.parallel === false ? "on this computer the learners take turns" : "the learners run side by side, one per core"}">⚡ ${esc(LAB.info.rate_label)}</span>`
+    + (LAB.info.lightgbm ? `<span class="chip" title="Boosted trees in compiled C++ (LightGBM ${esc(LAB.info.lightgbm)}) race the other learners">🌲 LightGBM</span>`
+      : `<span class="chip" title="The boosted trees run in NumPy. For faster, stronger trees on tables: pip install lightgbm, then restart AI Room">🌲 NumPy trees</span>`);
 }
 function valid(sel) {
   if (sel.kind === "model") return LAB.models.some((m) => m.id === sel.id);
@@ -180,7 +182,7 @@ function labWelcome() {
     <div class="row wrap gap-s" style="justify-content:center;margin-top:14px"><button class="btn primary" data-act="lab-pick">${icon("upload")} Choose a file</button><button class="btn" data-act="lab-paste">${icon("clip")} Paste data</button><button class="btn" data-act="lab-sample" data-arg="houses">🏠 Try the house-prices sample</button></div>
     <div class="grid g-3" style="margin-top:18px;text-align:left">
       <div class="card flat"><h3>⚡ Starts from zero</h3><p class="small muted">Every model starts with random weights. Nothing is pre-trained; it learns only from what you upload.</p></div>
-      <div class="card flat"><h3>🏁 A race of four learners</h3><p class="small muted">A one-shot net, a linear model, boosted trees and a neural network learn side by side. The best one (or a blend) wins.</p></div>
+      <div class="card flat"><h3>🏁 A race of learners</h3><p class="small muted">A one-shot net, a linear model, boosted trees${LAB.info.lightgbm ? " (LightGBM)" : ""} and a neural network learn side by side. The best one (or a blend) wins.</p></div>
       <div class="card flat"><h3>✅ An honest score</h3><p class="small muted">15% of rows are kept back and never seen while learning. The score you see is how it does on those.</p></div>
     </div></div>`;
 }

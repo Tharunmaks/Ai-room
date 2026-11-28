@@ -15,6 +15,11 @@ import time
 import traceback
 from multiprocessing.connection import wait
 
+try:                               # imported here, not in a learner process: an import running in another thread when
+    import threadpoolctl           # a process forks would leave that module locked in the new process
+except ImportError:
+    threadpoolctl = None
+
 
 def can_fork() -> bool:
     return sys.platform.startswith("linux") and (os.cpu_count() or 1) > 1 and os.environ.get("AI_ROOM_LAB_PARALLEL", "1") != "0"
@@ -24,7 +29,9 @@ def _plain_signals() -> None:
     """A forked worker inherits the parent's signal handlers: under the web server, SIGTERM would only ask the (copied)
     server to shut down, and the worker would keep running. Workers get the default handlers back."""
     import signal
-    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    for sig in (getattr(signal, n, None) for n in ("SIGTERM", "SIGINT", "SIGHUP")):
+        if sig is None:
+            continue
         try:
             signal.signal(sig, signal.SIG_DFL)
         except (OSError, ValueError):
@@ -50,7 +57,8 @@ def _limit_threads() -> None:
 
 def _child(learner, data, deadline, stop, conn) -> None:
     _plain_signals()
-    from . import learners as L
+    from . import learners as L, lgbm
+    lgbm.IN_WORKER = True          # LightGBM may use several threads here (never in the parent, which forks)
     L._POOL = None                 # the parent's histogram threads do not exist in this process
     L.HIST_THREADS = 1             # one core per learner: no extra threads
     _limit_threads()

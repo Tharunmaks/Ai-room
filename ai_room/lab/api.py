@@ -25,6 +25,8 @@ from . import media as mediamod, samples
 from .automl import MIN_SECONDS, RATE_LABEL, SECONDS_PER_MB, SPEED_LABELS, SPEEDS, Trained, budget_for, new_id, train_table
 from .data import IMAGE_EXT, DataError, Table, ext_of, pick_target, pick_task, profile, read_table, read_text
 from .images import describe_zip, load_image_zip
+from .lgbm import available as lightgbm_available
+from .parallel import can_fork
 from .ingest import DOC_EXT, head_text, human, inspect_table, load_table, load_text, max_cells, sniff_path
 from .textgen import MAX_CHARS, TextModel, train_text
 
@@ -75,6 +77,8 @@ def mount(app: FastAPI, data_dir: str | None) -> dict:
     ds_dir, model_dir = base / "datasets", base / "models"
     ds_dir.mkdir(parents=True, exist_ok=True)
     model_dir.mkdir(parents=True, exist_ok=True)
+    from .lgbm import warm
+    warm()                             # import LightGBM (if installed) now, in the background, not during a job
     jobs: dict[str, dict] = {}
     work: queue.Queue = queue.Queue()
     cache: OrderedDict[str, object] = OrderedDict()
@@ -164,6 +168,7 @@ def mount(app: FastAPI, data_dir: str | None) -> dict:
                 "rate_label": RATE_LABEL, "min_seconds": MIN_SECONDS,
                 "max_bytes": MAX_BYTES, "max_label": human(MAX_BYTES), "disk_free": free, "disk_free_label": human(free),
                 "cpus": os.cpu_count(), "numpy": numpy.__version__, "memory_cells": max_cells(), "ffmpeg": bool(mediamod.ffmpeg()),
+                "lightgbm": lightgbm_available(), "parallel": can_fork(),
                 "audio_ext": sorted(mediamod.AUDIO_EXT), "video_ext": sorted(mediamod.VIDEO_EXT), "image_ext": sorted(IMAGE_EXT),
                 "samples": [{"key": k, **v} for k, v in samples.SAMPLES.items()], "busy": sum(j["status"] in ("queued", "running") for j in jobs.values())}
 

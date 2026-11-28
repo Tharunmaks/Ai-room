@@ -90,10 +90,14 @@ def _resample(x: np.ndarray, rate: int) -> np.ndarray:
 
 def _with_file(raw: bytes, name: str, fn):
     """ffmpeg reads some formats only from a seekable file (MP4/M4A keep their index at the end)."""
-    with tempfile.NamedTemporaryFile(suffix=ext_of(name) or ".bin") as f:
-        f.write(raw)
-        f.flush()
-        return fn(f.name)
+    import os
+    fd, path = tempfile.mkstemp(suffix=ext_of(name) or ".bin")     # closed before ffmpeg opens it (needed on Windows)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+        return fn(path)
+    finally:
+        Path(path).unlink(missing_ok=True)
 
 
 def _ffmpeg_audio(raw: bytes, name: str, seconds: float, start: float | None = None) -> np.ndarray:
@@ -358,9 +362,16 @@ def load_zip(path: Path, kind: str, deadline: float | None = None, say=None, lim
                 break
         return (np.stack(feats) if feats else np.zeros((0, width), np.float32)), labels, bad
 
-    parts = max(1, min(8, (__import__("os").cpu_count() or 1))) if len(order) >= 64 and can_fork() else 1
-    bounds = np.linspace(0, len(order), parts + 1).astype(int)
-    results = fork_map(work, list(zip(bounds[:-1], bounds[1:]))) if parts > 1 else [work(0, len(order))]
+    parts = max(1, min(8, (__import__("os").cpu_count() or 1))) if len(order) >= 64 else 1
+    bounds = list(zip(*(lambda b: (b[:-1], b[1:]))(np.linspace(0, len(order), parts + 1).astype(int))))
+    if parts == 1:
+        results = [work(0, len(order))]
+    elif can_fork():
+        results = fork_map(work, bounds)
+    else:                          # Windows and macOS: threads (decoding and the FFTs let other threads run meanwhile)
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(parts) as ex:
+            results = list(ex.map(lambda b: work(*b), bounds))
     X = np.concatenate([r[0] for r in results]).astype(np.float64)
     labels = [l for r in results for l in r[1]]
     bad = sum(r[2] for r in results)

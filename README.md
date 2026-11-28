@@ -46,7 +46,7 @@ Categories: Core · Mathematics & Statistics · Physical Sciences · Life & Heal
 ## Quick start
 
 ```bash
-pip install -e .                      # add ".[pdf]" to import PDF books
+pip install -e .                      # add ".[pdf]" to import PDF books, ".[lightgbm]" for stronger trees in the Lab
 ollama pull qwen2.5:14b               # the student — any model ≤ 27B, via Ollama or an OpenAI-compatible server
 ai-room serve                         # open http://127.0.0.1:8765
 ```
@@ -117,6 +117,7 @@ Untrained learners race within the time allowed (**fast: 5 minutes per GB**, the
 | **One-shot net** | a wide layer of random features (random Fourier features), with the output layer **solved exactly** by ridge regression | no epochs at all: one linear solve, sized to the time it has. It is usually ready in **0.05–0.3 s** (about 2 s on 400,000 rows) and is often already good |
 | **Linear model** | logistic / linear regression with AdamW; reads **text columns** through a sparse, fastText-style layer over up to 262,144 hashed word and word-pair features | only the weights of words in the current batch are touched |
 | **Word counts** | for text columns with categories: complement naive Bayes over the same hashed words, with its smoothing chosen on the progress-check rows | counting, not training: one pass over the words |
+| **LightGBM** (optional: `pip install -e ".[lightgbm]"`) | Microsoft's histogram gradient boosting in compiled C++; when it is installed it takes the place of the NumPy boosted trees below | C++ on several cores (half of them inside the race, or all of them on its turn when learners take turns); it stops with just enough time to score the test rows, and its validation answers are kept from training rather than worked out again |
 | **Boosted trees** | histogram gradient boosting, written for this app in NumPy | bins features into 31–127 values (very common values such as zero get their own bin), **bundles one-hot columns** into one feature, reuses the parent histogram (right child = parent − left), looks at no more than 256 columns per tree on wide data such as pictures, scores the test rows tree by tree so nothing is left to do when the time is up, and stops when the validation loss stalls |
 | **Neural network** | a 256-256 ReLU network trained with AdamW, dropout, warm-up and cosine learning rate | mini-batches; it plans its epochs to fit the time it was given, and stops mid-epoch when the time is up |
 
@@ -148,7 +149,7 @@ This works well when the look, the sound or the movement tells the categories ap
 
 ### Measured
 
-These were measured on one 4-core Xeon (15 GB RAM, no GPU) at the default **5 minutes per GB** (0.3 s per MB, at least 0.5 s). Time is the whole job, timed from the stored file to the saved model, including reading the file.
+These were measured on one 4-core Xeon (15 GB RAM, no GPU) at the default **5 minutes per GB** (0.3 s per MB, at least 0.5 s), **without LightGBM** (what you get from a plain `pip install -e .`; the next table shows what LightGBM adds). Time is the whole job, timed from the stored file to the saved model, including reading the file.
 
 | Data | File | Time allowed | Took | Score on unseen rows | No learning |
 |---|---:|---:|---:|---|---|
@@ -173,24 +174,38 @@ These were measured on one 4-core Xeon (15 GB RAM, no GPU) at the default **5 mi
 
 Half the time of the previous default (10 minutes per GB, learners one after another) gave about the same scores: the forest cover type reached 85.7% in 21 s instead of 40 s, the 1.12 GB file 95.0% in 311 s instead of 95.1% in 586 s, and handwritten digits went up from 94.1% to 96.7%. California housing went down (0.800 → 0.775), and the text model learns a third of a 22 MB text instead of all of it, for nearly the same bits per character.
 
+**With LightGBM installed** (`pip install -e ".[lightgbm]"`), same computer and budgets. Scores vary from run to run, so a range is given where several runs were made:
+
+| Data | Without LightGBM | With LightGBM | Took | Winner |
+|---|---|---|---:|---|
+| Breast cancer | 98.8% | 98.8% | 0.48 s | LightGBM |
+| Handwritten digits | 96.7% | 96.7–97.8% | 0.48 s | one-shot net (trees are not the best tool for pixels) |
+| California housing (R²) | 0.775 | **0.81–0.85** (8 runs) | 0.49 s | LightGBM |
+| Adult income | 85.5% | **87.1%** | 1.52 s | LightGBM |
+| Forest cover type, all 581,012 rows | 85.7% | **88.4–89.3%** (4 runs) | 21.7 s | LightGBM |
+| Synthetic, 16 million rows (1.12 GB) | 95.0% | 95.1% | 312 s | neural network + LightGBM (LightGBM alone reached 94.9% in 108 s; the NumPy trees needed 234 s for 94.7%) |
+
+On the small samples (iris, spirals, houses, churn) the one-shot net or the linear model still wins and nothing changes, and tables whose only input is text (reviews, newsgroups) don't use the trees at all.
+
 The 1.12 GB file was uploaded with `curl -T`. From the first 4 MB the Lab estimated 15,999,487 rows (there are 16,000,000), read a uniform random sample of 4.9 million rows in 36 s, and learned and tested on it within the time; all four learners finished.
 
 **Compared with scikit-learn 1.9 defaults** on the same rows, split and features. Here the Lab got 5 minutes per GB (at least 0.5 s), and scikit-learn trained on 85% of the rows to the Lab's 70%:
 
-| Data | Lab at 5 min per GB | Best scikit-learn default |
-|---|---|---|
-| Iris | 90.0% in 0.3 s | 90.0% (boosted trees / logistic) |
-| Breast cancer | **98.8%** in 0.5 s | 96.5% |
-| Handwritten digits | **97.8%** in 0.5 s | 95.5% (boosted trees, 1.6 s) |
-| California housing (R²) | 0.773 in 0.5 s | **0.858** (boosted trees, 0.3 s) |
-| Adult income | 86.1% in 1.6 s | **87.2%** (boosted trees, 1.3 s) |
-| Forest cover type, all 581,012 rows | **85.7%** in 21 s (from the file) | 78.0% (boosted trees, 4.1 s: its early stopping ends early) |
+| Data | Lab at 5 min per GB | Lab with LightGBM | Best scikit-learn default |
+|---|---|---|---|
+| Iris | 90.0% in 0.3 s | 90.0% | 90.0% (boosted trees / logistic) |
+| Breast cancer | **98.8%** in 0.5 s | **98.8%** | 96.5% |
+| Handwritten digits | **97.8%** in 0.5 s | **96.7–97.8%** | 95.5% (boosted trees, 1.6 s) |
+| California housing (R²) | 0.773 in 0.5 s | 0.81–0.85 | **0.858** (boosted trees, 0.3 s) |
+| Adult income | 86.1% in 1.6 s | **87.1%** | **87.2%** (boosted trees, 1.3 s) |
+| Forest cover type, all 581,012 rows | 85.7% in 21 s (from the file) | **88.4–89.3%** | 78.0% (boosted trees, 4.1 s: its early stopping ends early) |
 
 What this shows, and what it doesn't:
 
 * **Every job finished inside 5 minutes per GB**, from a few kilobytes to 1.1 GB, and the first useful model arrives in well under a second for anything but very large files. When other programs are busy on the same computer, a job can take a little longer than allowed.
 * **Short budgets cost some accuracy on small files.** With 30 seconds instead of half a second, digits reached 97.0% and California housing 0.865 instead of 0.775, and the shapes pictures 84.4% instead of 81.1%. Choose **balanced** or **thorough** when accuracy matters more than seconds. Scores also vary a little from run to run, because how far the learners get depends on the time they have.
-* On medium tables, scikit-learn's compiled boosted trees are faster than this pure-NumPy Lab, and more accurate on two of the six tables at these budgets.
+* On medium tables, scikit-learn's compiled boosted trees are faster than the pure-NumPy Lab, and more accurate on two of the six tables at these budgets. With LightGBM installed, the Lab ties it on adult income and comes close on California housing; scikit-learn there trained on 85% of the rows with no time limit.
+* Every job stayed inside its time on a quiet computer, usually with 10–20 ms to spare on the half-second jobs. A busy computer can push one past by a few milliseconds.
 * The sound and video samples are made by code and are easy on purpose; real recordings are harder. Their test sets are small (60 and 48 files), so one file is about 2%.
 * Test sets of small tables are small: iris has 30 test rows, so one row is 3.3%. Differences of a row or two are luck.
 * The text writer is a statistical character model. It copies **style, spelling and layout** convincingly, but it does not understand or reason and knows nothing beyond your text. To get answers, use **Ask your text**.
@@ -220,7 +235,8 @@ curl -s "http://127.0.0.1:8765/api/lab/models/<id>/predict_media?filename=bark.m
 
 * PDF, DOCX, EPUB and zip files must be read whole, so those are limited to 4 GB; plain text, CSV and JSON-lines can be any size up to the cap. A single JSON array is limited to 2 GB; save bigger data as JSON-lines. Old .xls workbooks are not read (save as .xlsx or CSV), and only the first sheet of a workbook is used.
 * Only the linear model and word counts read text columns. The trees, the one-shot net and the neural network use the number, category and date columns, and on tables that have both kinds, the average of the learners combines the two views.
-* Learners run side by side in separate processes on Linux. On macOS and Windows they take turns in one process, sharing the time instead (`AI_ROOM_LAB_PARALLEL=0` does the same on Linux).
+* Learners run side by side in separate processes on Linux. On macOS and Windows they take turns in one process, sharing the time instead (`AI_ROOM_LAB_PARALLEL=0` does the same on Linux); LightGBM then uses every core on its turn. Measured with turns on the same computer: California housing 0.810, adult income 87.1%, forest cover 86.8%, all inside the time.
+* LightGBM is imported in the background when AI Room starts (it takes up to a second). A job started in that first second uses the NumPy trees instead. A model trained with LightGBM needs LightGBM installed to be used; it is saved as LightGBM's own text format inside the model file, so loading it still never runs code.
 * Sounds other than WAV and videos other than animated GIF need ffmpeg on the computer that trains. Only the first 30 s of each sound and the first 2 minutes of each video are used.
 * One job trains at a time; others wait in a queue. Models are saved as JSON + NumPy arrays in `data/lab/` (no pickle), so loading a model never runs code.
 * Phones: the Lab needs NumPy (`pkg install python-numpy` in Termux before `pip install -e .`).
@@ -385,6 +401,7 @@ ai_room/
     learners.py        the untrained learners: one-shot net, word counts, histogram boosted trees, neural network / linear model
     automl.py          70/15/15 split, the time-budgeted race, choosing the winner, metrics, importance, save/load
     parallel.py        learners side by side in forked processes (one per core), stopped for sure at the deadline
+    lgbm.py            optional LightGBM learner: imported ahead of time, fork-safe, saved as text (no pickle)
     textgen.py         one-pass character model (modified Kneser–Ney) and BM25 passage search
     api.py  cli.py     Lab HTTP API with a training queue (`/api/lab/…`) and `ai-room lab …`
     xlsx.py            Excel workbooks with the standard library      images.py   pictures → 936 features, contact sheets

@@ -18,6 +18,7 @@ import numpy as np
 
 from .data import DataError, Encoder, Table, XData, cell_str, missing_mask, pick_target, pick_task, profile, to_float, to_floats
 from .learners import Baseline, Boosted, Learner, Neural, OneShot, Task, WordCounts, linear, log_loss
+from .lgbm import LightGBM, ready as lightgbm_ready
 from .parallel import can_fork, finished_predictions, race
 
 SECONDS_PER_GB = 300.0                       # 5 minutes per gigabyte
@@ -36,13 +37,19 @@ def budget_for(speed: str, size_bytes: float) -> float:
     speed = "fast" if speed == "quick" else speed
     per_mb = max(MIN_SECONDS, size_bytes / 1e6 * SECONDS_PER_MB)
     return per_mb if speed == "fast" else max(SPEEDS.get(speed, 30.0), per_mb)
-SHARES = {"linear": 0.08, "oneshot": 0.12, "words": 0.05, "boost": 0.45, "mlp": 0.35}
-ORDER = ["baseline", "oneshot", "words", "linear", "boost", "mlp"]
+SHARES = {"linear": 0.08, "oneshot": 0.12, "words": 0.05, "lgbm": 0.45, "boost": 0.45, "mlp": 0.35}
+ORDER = ["baseline", "oneshot", "words", "linear", "lgbm", "boost", "mlp"]
 
 
 def make_learner(key: str, seed: int = 0) -> Learner:
     return {"baseline": Baseline, "oneshot": lambda: OneShot(seed=seed), "linear": linear, "words": WordCounts,
-            "boost": lambda: Boosted(seed=seed), "mlp": lambda: Neural(seed=seed)}[key]()
+            "lgbm": lambda: LightGBM(seed=seed), "boost": lambda: Boosted(seed=seed), "mlp": lambda: Neural(seed=seed)}[key]()
+
+
+def default_learners() -> list[str]:
+    """Every learner, with LightGBM (when installed and imported: see lgbm.warm) in place of the NumPy boosted trees,
+    which do the same job slower."""
+    return [k for k in ORDER if k != ("boost" if lightgbm_ready() else "lgbm")]
 
 
 # ------------------------------------------------------------------ metrics
@@ -166,7 +173,7 @@ class Trained:
         with np.load(folder / "weights.npz", allow_pickle=False) as z:
             arrays = {k: z[k] for k in z.files}
         enc = Encoder.from_state(meta["encoder"], {k[4:]: v for k, v in arrays.items() if k.startswith("enc.")})
-        classes = {"Baseline": Baseline, "OneShot": OneShot, "Boosted": Boosted, "Neural": Neural, "WordCounts": WordCounts}
+        classes = {"Baseline": Baseline, "OneShot": OneShot, "Boosted": Boosted, "Neural": Neural, "WordCounts": WordCounts, "LightGBM": LightGBM}
         learners = []
         for i, lm in enumerate(meta["learners"]):
             pre = f"l{i}."
@@ -257,7 +264,7 @@ def train_table(columns, rows=None, target: str | None = None, task: str = "auto
          else f"Turned {words} into word features") + f" ({time.perf_counter() - t_start:.2f} s so far).",
         features=Xtr.dense.shape[1], text_columns=n_text, columns=used)
 
-    wanted = [k for k in ORDER if k in (learners or ORDER) or k == "baseline"]
+    wanted = [k for k in ORDER if k in (learners or default_learners()) or k == "baseline"]
     pool = []
     for k in wanted:
         l = make_learner(k, seed)

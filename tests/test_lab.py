@@ -160,7 +160,7 @@ def test_one_hot_columns_are_bundled_and_skewed_columns_keep_their_bins():
 def test_train_table_beats_no_learning_and_reports_honestly():
     cols, rows = rings(500)
     events = []
-    m = train_table(cols, rows, "where", budget=6, progress=events.append)
+    m = train_table(cols, rows, "where", budget=6, progress=events.append, learners=["oneshot", "linear", "boost", "mlp"])
     r = m.report
     assert r["task"] == "classification" and r["classes"] == ["in", "out"]
     assert r["split"]["train"] + r["split"]["valid"] + r["split"]["test"] == 500
@@ -724,3 +724,65 @@ def test_api_learns_sounds_and_videos_and_answers_about_new_ones(lab):
     gif = __import__("zipfile").ZipFile(io.BytesIO(samples.motions(per_class=1, frames=6, seed=3))).read("motions/bouncing/bouncing_000.gif")
     r = lab.post(f"/api/lab/models/{j['model']}/predict_media?filename=clip.gif", content=gif).json()
     assert r["media"] == "video" and r["prediction"]["prediction"] in vp["classes"]
+
+
+# ------------------------------------------------------------------ LightGBM (optional)
+needs_lightgbm = pytest.mark.skipif(not __import__("ai_room.lab.lgbm", fromlist=["available"]).available(), reason="LightGBM is not installed")
+
+
+@needs_lightgbm
+def test_lightgbm_learns_every_kind_of_task_and_travels_as_text():
+    import pickle
+    from ai_room.lab.data import XData
+    from ai_room.lab.lgbm import LightGBM, warm
+    warm(wait=True)
+    rng = np.random.default_rng(3)
+    X = rng.uniform(-1, 1, (1500, 4)).astype(np.float32)
+    cases = {
+        "binary": (Task("classification", 2), ((X[:, 0] * X[:, 1] > 0) ^ (X[:, 2] > 0.6)).astype(np.int64)),
+        "three classes": (Task("classification", 3), np.digitize(X[:, 0] + X[:, 1] ** 2, [-0.2, 0.6]).astype(np.int64)),
+        "numbers": (Task("regression"), (np.sin(3 * X[:, 0]) + X[:, 1] ** 2).astype(np.float32)),
+    }
+    for name, (task, y) in cases.items():
+        if task.kind == "regression":
+            y = (y - y.mean()) / y.std()
+        l = LightGBM()
+        l.extra_eval = XData(X[1200:])
+        l.fit(XData(X[:900]), y[:900], XData(X[900:1200]), y[900:1200], task, time.perf_counter() + 20, lambda **k: None, None)
+        pv, pt = l.__dict__.pop("done_preds")
+        assert np.allclose(pv, l.predict(XData(X[900:1200])), atol=1e-5) and np.allclose(pt, l.predict(XData(X[1200:])), atol=1e-5), name
+        p = l.predict(XData(X[1200:]))
+        score = (p.argmax(1) == y[1200:]).mean() if task.kind == "classification" else 1 - ((p - y[1200:]) ** 2).mean() / y[1200:].var()
+        assert score > 0.85, (name, score)
+        l.extra_eval = None
+        l2 = pickle.loads(pickle.dumps(l))                      # how it comes back from its learner process
+        meta, arrays = l2.state()
+        l3 = LightGBM.from_state(json.loads(json.dumps(meta)), arrays)     # how it is saved: text in an array, no pickle
+        assert np.allclose(l3.predict(XData(X[1200:])), p, atol=1e-6) and l3.rounds == l.rounds, name
+
+
+@needs_lightgbm
+def test_lightgbm_takes_the_place_of_the_numpy_trees_and_forking_stays_safe(tmp_path):
+    from ai_room.lab.automl import default_learners
+    from ai_room.lab.lgbm import warm
+    warm(wait=True)
+    assert "lgbm" in default_learners() and "boost" not in default_learners()
+    cols, rows = rings(1200)
+    for run in range(2):          # the second race forks after this process has used LightGBM (predictions, importance)
+        events = []
+        m = train_table(cols, rows, "where", budget=4, progress=events.append)
+        done = {e["learner"] for e in events if e["type"] == "learner_done"}
+        failed = [e for e in events if e["type"] == "learner_failed"]
+        assert "lgbm" in done and not failed, (run, failed)
+        assert m.report["test"]["accuracy"] > 0.85
+        if run == 0:              # make sure this process has used LightGBM itself before the next race forks
+            from ai_room.lab.data import XData
+            from ai_room.lab.lgbm import LightGBM
+            X, y = xy_data(400)
+            l = LightGBM()
+            l.fit(XData(X[:300]), y[:300], XData(X[300:]), y[300:], Task("classification", 2), time.perf_counter() + 5, lambda **k: None, None)
+            l.predict(XData(X))
+            LightGBM.from_state(*l.state()).predict(XData(X))
+    m.save(tmp_path / "m")
+    probe = [{"x": 0, "y": 0, "noise": 1}, {"x": 0.95, "y": 0.95, "noise": 0}]
+    assert [p["prediction"] for p in Trained.load(tmp_path / "m").predict(probe)] == [p["prediction"] for p in m.predict(probe)] == ["in", "out"]

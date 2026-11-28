@@ -31,11 +31,30 @@ def max_cells() -> int:
     env = os.environ.get("AI_ROOM_LAB_MAX_CELLS")
     if env:
         return int(float(env))
+    return int(np.clip(free_memory() * 0.25 / 70, 2_000_000, 120_000_000))
+
+
+def free_memory() -> int:
+    """Bytes of RAM free now (Linux, macOS, Windows); 4 GB if it cannot be told."""
     try:
-        avail = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
     except (ValueError, OSError, AttributeError):
-        avail = 4 << 30
-    return int(np.clip(avail * 0.25 / 70, 2_000_000, 120_000_000))
+        pass
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong), ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong), ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong), ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            m = MemoryStatus()
+            m.dwLength = ctypes.sizeof(MemoryStatus)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+                return int(m.ullAvailPhys)
+        except Exception:  # not available: fall back to a safe guess
+            pass
+    return 4 << 30
 
 
 # ------------------------------------------------------------------ saving uploads

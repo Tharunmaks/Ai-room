@@ -58,6 +58,8 @@ def cmd_train(a) -> None:
     if not path.exists():
         raise SystemExit(f"No such file: {path}")
     speed = "fast" if a.speed == "quick" else a.speed
+    from .lgbm import warm
+    warm(wait=True)                    # LightGBM (if installed) is imported before the clock starts, like NumPy
     size = path.stat().st_size
     budget = budget_for(speed, size)
     show, t0 = _printer()
